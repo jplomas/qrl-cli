@@ -48,8 +48,8 @@ const { DILLIBmodule } = require('qrllib/build/offline-libjsdilithium')
 // eslint-disable-next-line no-unused-vars
 const { KYBLIBmodule } = require('qrllib/build/offline-libjskyber')
 const Crypto = require('crypto')
-const eccrypto = require('eccrypto')
 const aesjs = require('aes-js')
+const eccrypto = require('../utils/silent-eccrypto')
 const Qrlnode = require('../functions/grpc')
 
 let KYBLIBLoaded = false
@@ -318,7 +318,7 @@ class LatticeShared extends Command {
       network = `Custom GRPC endpoint: [${flags.grpc}]`
     }
     if (flags.testnet) {
-      grpcEndpoint = 'testnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'testnet-3.automated.theqrl.org:19009'
       network = 'Testnet'
     }
     if (flags.mainnet) {

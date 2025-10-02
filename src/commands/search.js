@@ -68,7 +68,7 @@ class Search extends Command {
  
 
     if (flags.testnet) {
-      grpcEndpoint = 'testnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'testnet-3.automated.theqrl.org:19009'
       network = 'Testnet'
     }
     if (flags.mainnet) {

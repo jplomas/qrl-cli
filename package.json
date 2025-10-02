@@ -41,14 +41,13 @@
   "devDependencies": {
     "@oclif/dev-cli": "^1",
     "@oclif/test": "^1",
-    "babel-eslint": "^10.1.0",
+    "@babel/eslint-parser": "^7.25.8",
     "chai": "^4",
     "codecov": "^3.6.5",
-    "eslint": "^7.19.0",
-    "eslint-config-airbnb": "^18.2.1",
-    "eslint-config-import": "^0.13.0",
-    "eslint-config-prettier": "^7.2.0",
-    "eslint-plugin-import": "^2.22.1",
+    "eslint": "^8.57.1",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.31.0",
     "globby": "^10",
     "mocha": "^7.1.2",
     "nyc": "^15.0.1",
@@ -58,9 +57,11 @@
     "node": ">=16.0.0"
   },
   "files": [
+    "/assets",
     "/bin",
     "/npm-shrinkwrap.json",
     "/oclif.manifest.json",
+    "/scripts",
     "/src"
   ],
   "homepage": "https://github.com/theqrl/qrl-cli",
@@ -81,6 +82,9 @@
   },
   "repository": "theqrl/qrl-cli",
   "scripts": {
+    "lint": "eslint . --ext .js",
+    "lint:fix": "eslint . --ext .js --fix",
+    "postinstall": "node scripts/postinstall.js",
     "postpack": "rm -f oclif.manifest.json",
     "posttest": "eslint .",
     "prepack": "oclif-dev manifest && oclif-dev readme",

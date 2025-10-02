@@ -12,7 +12,7 @@ const { cli } = require('cli-ux')
 const { QRLLIBmodule } = require('qrllib/build/offline-libjsqrl') // eslint-disable-line no-unused-vars
 const { DILLIBmodule } = require('qrllib/build/offline-libjsdilithium') // eslint-disable-line no-unused-vars
 const { KYBLIBmodule } = require('qrllib/build/offline-libjskyber') // eslint-disable-line no-unused-vars
-const eccrypto = require('eccrypto')
+const eccrypto = require('../utils/silent-eccrypto')
 const Qrlnode = require('../functions/grpc')
 
 let QRLLIBLoaded = false
@@ -147,7 +147,7 @@ class Lattice extends Command {
       network = `Custom GRPC endpoint: [${flags.grpc}]`
     }
     if (flags.testnet) {
-      grpcEndpoint = 'testnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'testnet-3.automated.theqrl.org:19009'
       network = 'Testnet'
     }
     if (flags.mainnet) {
