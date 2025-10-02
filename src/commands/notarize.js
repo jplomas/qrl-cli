@@ -127,7 +127,7 @@ class Notarise extends Command {
     let notarialHash
 
     // network stuff, defaults to mainnet
-    let grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+    let grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
     let network = 'Mainnet'
 
     if (flags.grpc) {
@@ -139,7 +139,7 @@ class Notarise extends Command {
       network = 'Testnet'
     }
     if (flags.mainnet) {
-      grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
       network = 'Mainnet'
     }
     if (!flags.json){

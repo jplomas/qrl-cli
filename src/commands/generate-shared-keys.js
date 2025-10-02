@@ -310,7 +310,7 @@ class LatticeShared extends Command {
 // /////////////////////////
 // network stuff
 // /////////////////////////
-    let grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+    let grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
     let network = 'Mainnet'
 
     if (flags.grpc) {
@@ -322,7 +322,7 @@ class LatticeShared extends Command {
       network = 'Testnet'
     }
     if (flags.mainnet) {
-      grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
       network = 'Mainnet'
     }
     this.log(`Generate Lattice Shared_Keys...`)

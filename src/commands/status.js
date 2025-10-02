@@ -11,7 +11,7 @@ const shorPerQuanta = 10 ** 9
 class Status extends Command {
   async run() {
     const { flags } = this.parse(Status)
-    let grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+    let grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
     let network = 'Mainnet'
     if (flags.grpc) {
       grpcEndpoint = flags.grpc
@@ -22,7 +22,7 @@ class Status extends Command {
       network = 'Testnet'
     }
     if (flags.mainnet) {
-      grpcEndpoint = 'mainnet-1.automated.theqrl.org:19009'
+      grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
       network = 'Mainnet'
     }
     this.log(white().bgBlue(network))
