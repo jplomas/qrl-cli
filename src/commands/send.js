@@ -12,6 +12,7 @@ const helpers = require('@theqrl/explorer-helpers')
 const aes = require('../utils/aes')
 
 const Qrlnode = require('../functions/grpc')
+const { signBoundTransaction, ResponseBindingError } = require('../functions/tx-binding')
 
 let QRLLIBLoaded = false
 
@@ -30,14 +31,6 @@ const waitForQRLLIB = (callBack) => {
 }
 
 const shorPerQuanta = 10 ** 9
-
-const toUint8Vector = (arr) => {
-  const vec = new QRLLIB.Uint8Vector()
-  for (let i = 0; i < arr.length; i += 1) {
-    vec.push_back(arr[i])
-  }
-  return vec
-}
 
 // string to binary
 function string2Bin(str) {
@@ -61,56 +54,8 @@ function bytesToHex(byteArray) {
 }
 
 // Concatenates multiple typed arrays into one.
-function concatenateTypedArrays(resultConstructor, ...arrays) {
-  /* eslint-disable */
-  let totalLength = 0
-  for (let arr of arrays) {
-    totalLength += arr.length
-  }
-  const result = new resultConstructor(totalLength)
-  let offset = 0
-  for (let arr of arrays) {
-    result.set(arr, offset)
-    offset += arr.length
-  }
-  /* eslint-enable */
-  return result
-}
-
 // Take input and convert to unsigned uint64 bigendian bytes
-function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
-  let input = i
-  if (!Number.isInteger(input)) {
-    input = parseInt(input, 10)
-  }
-
-  const byteArray = [0, 0, 0, 0, 0, 0, 0, 0]
-
-  for (let index = 0; index < byteArray.length; index += 1) {
-    const byte = input & 0xff // eslint-disable-line no-bitwise
-    byteArray[index] = byte
-    input = (input - byte) / 256
-  }
-
-  byteArray.reverse()
-
-  if (bufferResponse === true) {
-    const result = Buffer.from(byteArray)
-    return result
-  }
-  const result = new Uint8Array(byteArray)
-  return result
-}
-
 // Convert Binary object to Bytes
-function binaryToBytes(convertMe) {
-  const thisBytes = new Uint8Array(convertMe.size())
-  for (let i = 0; i < convertMe.size(); i += 1) {
-    thisBytes[i] = convertMe.get(i)
-  }
-  return thisBytes
-}
-
 const openWalletFile = (path) => {
   const contents = fs.readFileSync(path)
   return JSON.parse(contents)[0]
@@ -382,8 +327,12 @@ class Send extends Command {
     let address = ''
     if (flags.wallet) {
       let isValidFile = false
-      const walletJson = openWalletFile(flags.wallet)
+      let walletJson
       try {
+        // Inside the try: a missing or malformed file must reach the "invalid wallet file"
+        // message below, not escape as an unhandled ENOENT from readFileSync or a SyntaxError
+        // from JSON.parse.
+        walletJson = openWalletFile(flags.wallet)
         if (walletJson.encrypted === false) {
           isValidFile = true
           address = walletJson.address
@@ -613,63 +562,59 @@ class Send extends Command {
 
       let txnHash
       if (!flags.loadfromfile) {
-        const spinner2 = ora({ text: 'Signing transaction...' }).start()
-        let concatenatedArrays
+        const spinner2 = ora({ text: 'Verifying node response and signing transaction...' }).start()
+
+        // Preimage order is QRL core's TransferTransaction.get_data_bytes():
+        //   fee || message_data || (address || amount)*
+        // Each part is checked against the outputs this command was asked to send before it is
+        // signed, and the signed bytes come from our copy. With --savetofile the "node response"
+        // is the locally built transaction above, so these checks are trivially satisfied.
+        const returnedTx = tx.extended_transaction_unsigned.tx
+        const parts = [
+          { name: 'fee', kind: 'uint64', local: fee, remote: returnedTx.fee },
+        ]
         if (flags.message) {
-          concatenatedArrays = concatenateTypedArrays(
-            Uint8Array,
-            toBigendianUint64BytesUnsigned(tx.extended_transaction_unsigned.tx.fee),
-            messageBytes,
-          )
+          parts.push({
+            name: 'message',
+            kind: 'bytes',
+            local: messageBytes,
+            remote: returnedTx.transfer.message_data,
+          })
         }
-        else {
-          concatenatedArrays = concatenateTypedArrays(
-            Uint8Array,
-            toBigendianUint64BytesUnsigned(tx.extended_transaction_unsigned.tx.fee),
-          )
+        parts.push({
+          name: 'transfer',
+          kind: 'pairs',
+          local: { addresses: thisAddressesTo, amounts: thisAmounts },
+          remote: { addresses: returnedTx.transfer.addrs_to, amounts: returnedTx.transfer.amounts },
+        })
+
+        let signature
+        try {
+          const bound = signBoundTransaction({
+            parts,
+            xmss: XMSS_OBJECT,
+            otsIndex: flags.otsindex,
+            publicKey: xmssPK,
+          })
+          signature = bound.signature
+          txnHash = bound.txnHash
+        } catch (err) {
+          if (err instanceof ResponseBindingError) {
+            spinner2.fail(`Refusing to sign: ${err.message}`)
+            this.log(`${red('⨉')} The node did not return the transaction that was requested.`)
+            this.log('Nothing was signed, no OTS key was used, and no funds have moved.')
+            this.log('If this persists, connect to a different node with --grpc.')
+            this.exit(1)
+          }
+          spinner2.fail(`Failed to sign transaction: ${err.message}`)
+          this.exit(1)
         }
 
-        // Now append all recipient (outputs) to concatenatedArrays
-        const addrsToRaw = tx.extended_transaction_unsigned.tx.transfer.addrs_to
-        const amountsRaw = tx.extended_transaction_unsigned.tx.transfer.amounts
-        const destAddr = []
-        const destAmount = []
-        for (let i = 0; i < addrsToRaw.length; i += 1) {
-          // Add address
-          concatenatedArrays = concatenateTypedArrays(Uint8Array, concatenatedArrays, addrsToRaw[i])
-
-          // Add amount
-          concatenatedArrays = concatenateTypedArrays(
-            Uint8Array,
-            concatenatedArrays,
-            toBigendianUint64BytesUnsigned(amountsRaw[i])
-          )
-
-          // Add to array for Ledger Transactions
-          destAddr.push(Buffer.from(addrsToRaw[i]))
-          destAmount.push(toBigendianUint64BytesUnsigned(amountsRaw[i], true))
-        }
-
-        // Convert Uint8Array to VectorUChar
-        const hashableBytes = toUint8Vector(concatenatedArrays)
-
-        // Create sha256 sum of concatenated array
-        const shaSum = QRLLIB.sha2_256(hashableBytes)
-
-        XMSS_OBJECT.setIndex(parseInt(flags.otsindex, 10))
-        const signature = binaryToBytes(XMSS_OBJECT.sign(shaSum))
-        // Calculate transaction hash
-        const txnHashConcat = concatenateTypedArrays(Uint8Array, binaryToBytes(shaSum), signature, xmssPK)
-
-        const txnHashableBytes = toUint8Vector(txnHashConcat)
-
-        txnHash = QRLLIB.bin2hstr(QRLLIB.sha2_256(txnHashableBytes))
-
-        text = flags.savetofile ? `Transaction signed with OTS key ${flags.otsindex}` : `Transaction signed with OTS key ${flags.otsindex}. (nodes will reject this transaction if key reuse is detected)`
+        text = flags.savetofile ? `Transaction signed with OTS key ${flags.otsindex}` : `Node response matches the request. Transaction signed with OTS key ${flags.otsindex}. (nodes will reject this transaction if key reuse is detected)`
         spinner2.succeed(text)
 
-        tx.extended_transaction_unsigned.tx.signature = Buffer.from(signature)
-        tx.extended_transaction_unsigned.tx.public_key = Buffer.from(xmssPK) // eslint-disable-line camelcase
+        returnedTx.signature = Buffer.from(signature)
+        returnedTx.public_key = Buffer.from(xmssPK) // eslint-disable-line camelcase
       } else {
         txnHash = tx.extended_transaction_unsigned.tx.transaction_hash
       }

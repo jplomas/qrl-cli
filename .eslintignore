@@ -3,3 +3,8 @@
 
 tmp/*
 
+# Generated coverage output. nyc's lcov reporter writes a vendored HTML report
+# (sorter.js, prettify.js, block-navigation.js), and `posttest` runs eslint after
+# `npm test` — so without this a future istanbul release could fail the build.
+coverage/*
+.nyc_output/*

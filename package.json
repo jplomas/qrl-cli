@@ -77,6 +77,20 @@
     ]
   },
   "repository": "theqrl/qrl-cli",
+  "nyc": {
+    "reporter": [
+      "text",
+      "lcov"
+    ],
+    "report-dir": "coverage",
+    "exclude": [
+      "test/**",
+      "scripts/**",
+      "dist/**",
+      "assets/**",
+      "coverage/**"
+    ]
+  },
   "scripts": {
     "lint": "eslint . --ext .js",
     "lint:fix": "eslint . --ext .js --fix",
@@ -85,6 +99,8 @@
     "posttest": "eslint .",
     "prepack": "oclif-dev manifest && oclif-dev readme",
     "test": "nyc mocha --require test/hooks.js --forbid-only -t 240000 \"test/**/*.test.js\"",
+    "coverage": "nyc --reporter=text --reporter=html --reporter=lcov mocha --require test/hooks.js --forbid-only -t 240000 \"test/**/*.test.js\"",
+    "coverage:report": "nyc report --reporter=text --reporter=html",
     "test-balance": "nyc mocha --forbid-only -t 50000 \"test/commands/balance.test.js\"",
     "test-create-wallet": "nyc mocha --forbid-only -t 50000 \"test/commands/create-wallet.test.js\"",
     "test-generate-lattice-keys": "nyc mocha --require test/hooks.js --forbid-only -t 50000 \"test/commands/generate-lattice-keys.test.js\"",

@@ -11,6 +11,7 @@ const aes = require('../../utils/aes')
 
 const Qrlnode = require('../../functions/grpc')
 const { getNetworkSetup } = require('../../functions/network-helper')
+const { signBoundTransaction, ResponseBindingError } = require('../../functions/tx-binding')
 
 let QRLLIBLoaded = false
 
@@ -24,60 +25,6 @@ const waitForQRLLIB = (callBack) => {
     }
     return false
   }, 50)
-}
-
-const toUint8Vector = (arr) => {
-  const vec = new QRLLIB.Uint8Vector()
-  for (let i = 0; i < arr.length; i += 1) {
-    vec.push_back(arr[i])
-  }
-  return vec
-}
-
-function concatenateTypedArrays(resultConstructor, ...arrays) {
-  let totalLength = 0
-  arrays.forEach((arr) => {
-    totalLength += arr.length
-  })
-  // eslint-disable-next-line new-cap
-  const result = new resultConstructor(totalLength)
-  let offset = 0
-  arrays.forEach((arr) => {
-    result.set(arr, offset)
-    offset += arr.length
-  })
-  return result
-}
-
-function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
-  let input = i
-  if (!Number.isInteger(input)) {
-    input = parseInt(input, 10)
-  }
-
-  const byteArray = [0, 0, 0, 0, 0, 0, 0, 0]
-
-  for (let index = 0; index < byteArray.length; index += 1) {
-    // eslint-disable-next-line no-bitwise
-    const byte = input & 0xff
-    byteArray[index] = byte
-    input = (input - byte) / 256
-  }
-
-  byteArray.reverse()
-
-  if (bufferResponse === true) {
-    return Buffer.from(byteArray)
-  }
-  return new Uint8Array(byteArray)
-}
-
-function binaryToBytes(convertMe) {
-  const thisBytes = new Uint8Array(convertMe.size())
-  for (let i = 0; i < convertMe.size(); i += 1) {
-    thisBytes[i] = convertMe.get(i)
-  }
-  return thisBytes
 }
 
 const openWalletFile = (path) => {
@@ -211,8 +158,12 @@ class TokenTransfer extends Command {
     let address = ''
     if (flags.wallet) {
       let isValidFile = false
-      const walletJson = openWalletFile(flags.wallet)
+      let walletJson
       try {
+        // Inside the try: a missing or malformed file must reach the "invalid wallet file"
+        // message below, not escape as an unhandled ENOENT from readFileSync or a SyntaxError
+        // from JSON.parse.
+        walletJson = openWalletFile(flags.wallet)
         if (walletJson.encrypted === false) {
           isValidFile = true
           address = walletJson.address
@@ -299,10 +250,18 @@ class TokenTransfer extends Command {
 
       const rawRecipient = Buffer.from(flags.recipient.substring(1), 'hex')
 
+      // The token hash has two forms and they are not interchangeable:
+      //   * over the wire to GetTransferTokenTxn, the node wants the ASCII hex *string* —
+      //     PublicAPIService.GetTransferTokenTxn does `hstr2bin(request.token_txhash.decode())`,
+      //     so raw bytes make it raise 'utf-8' codec can't decode byte ... (INVALID_ARGUMENT);
+      //   * in the signing preimage and in the transaction itself it is the raw 32 bytes,
+      //     because that is what TransferTokenTransaction.get_data_bytes() commits to.
+      const rawTokenHash = Buffer.from(flags.tokenHash, 'hex')
+
       const request = {
         master_addr: Buffer.from('', 'hex'),
         addresses_to: [rawRecipient],
-        token_txhash: Buffer.from(flags.tokenHash, 'hex'),
+        token_txhash: Buffer.from(flags.tokenHash),
         amounts: [parseInt(flags.amount, 10)],
         fee,
         xmss_pk: xmssPK,
@@ -316,37 +275,61 @@ class TokenTransfer extends Command {
         this.exit(1)
       }
 
-      const spinnerSign = ora({ text: 'Signing transaction...' }).start()
-      
-      let concatenatedArrays = concatenateTypedArrays(
-        Uint8Array,
-        Buffer.from('', 'hex'), // master_addr
-        toBigendianUint64BytesUnsigned(transferTx.extended_transaction_unsigned.tx.fee),
-        Buffer.from(flags.tokenHash, 'hex'),
-      )
+      const spinnerSign = ora({ text: 'Verifying node response and signing transaction...' }).start()
 
-      const addrsToRaw = transferTx.extended_transaction_unsigned.tx.transfer_token.addrs_to
-      const amountsRaw = transferTx.extended_transaction_unsigned.tx.transfer_token.amounts
-
-      for (let index = 0; index < addrsToRaw.length; index += 1) {
-        concatenatedArrays = concatenateTypedArrays(Uint8Array, concatenatedArrays, addrsToRaw[index])
-        concatenatedArrays = concatenateTypedArrays(
-          Uint8Array,
-          concatenatedArrays,
-          toBigendianUint64BytesUnsigned(amountsRaw[index])
-        )
+      const returnedTx = transferTx.extended_transaction_unsigned.tx
+      let signature
+      try {
+        // Preimage order is QRL core's TransferTokenTransaction.get_data_bytes():
+        //   master_addr || fee || token_txhash || (address || amount)*
+        // Every part is compared against what we asked the node for and then signed from our
+        // own copy, so a substituted recipient, amount or fee cannot reach the signature.
+        const bound = signBoundTransaction({
+          xmss: XMSS_OBJECT,
+          otsIndex: flags.otsindex,
+          publicKey: xmssPK,
+          parts: [
+            {
+              name: 'master address',
+              kind: 'bytes',
+              local: request.master_addr,
+              remote: returnedTx.master_addr,
+            },
+            { name: 'fee', kind: 'uint64', local: request.fee, remote: returnedTx.fee },
+            {
+              name: 'token hash',
+              kind: 'bytes',
+              local: rawTokenHash,
+              remote: returnedTx.transfer_token.token_txhash,
+            },
+            {
+              name: 'transfer',
+              kind: 'pairs',
+              local: { addresses: request.addresses_to, amounts: request.amounts },
+              remote: {
+                addresses: returnedTx.transfer_token.addrs_to,
+                amounts: returnedTx.transfer_token.amounts,
+              },
+            },
+          ],
+        })
+        signature = bound.signature
+      } catch (err) {
+        if (err instanceof ResponseBindingError) {
+          spinnerSign.fail(`Refusing to sign: ${err.message}`)
+          this.log(red('\nThe node did not return the transaction that was requested.'))
+          this.log('Nothing was signed, no OTS key was used, and no funds have moved.')
+          this.log('If this persists, connect to a different node with --grpc.')
+          this.exit(1)
+        }
+        spinnerSign.fail(`Failed to sign transaction: ${err.message}`)
+        this.exit(1)
       }
 
-      const hashableBytes = toUint8Vector(concatenatedArrays)
-      const shaSum = QRLLIB.sha2_256(hashableBytes) // eslint-disable-line no-undef
+      returnedTx.signature = Buffer.from(signature)
+      returnedTx.public_key = Buffer.from(xmssPK)
 
-      XMSS_OBJECT.setIndex(parseInt(flags.otsindex, 10))
-      const signature = binaryToBytes(XMSS_OBJECT.sign(shaSum))
-
-      transferTx.extended_transaction_unsigned.tx.signature = Buffer.from(signature)
-      transferTx.extended_transaction_unsigned.tx.public_key = Buffer.from(xmssPK)
-
-      spinnerSign.succeed(`Transaction signed with OTS key ${flags.otsindex}`)
+      spinnerSign.succeed(`Node response matches the request. Transaction signed with OTS key ${flags.otsindex}`)
 
       const spinnerPush = ora({ text: 'Pushing signed transaction to network...' }).start()
       
@@ -369,18 +352,29 @@ class TokenTransfer extends Command {
         }
         
         const pushResHash = Buffer.from(response.tx_hash).toString('hex')
+
+        // Report what was signed, not what was typed. These are equal because the transaction
+        // was bound to the request before signing — reading them back off the signed payload is
+        // what makes that visible to the user instead of merely echoing their own arguments.
+        const signedRecipient = `Q${Buffer.from(returnedTx.transfer_token.addrs_to[0]).toString('hex')}`
+        const signedTokenHash = Buffer.from(returnedTx.transfer_token.token_txhash).toString('hex')
+        const signedAmount = String(returnedTx.transfer_token.amounts[0])
+        const signedFee = String(returnedTx.fee)
+
         spinnerPush.succeed(`Tokens transferred successfully!`)
-        this.log(green('\nTransaction Information:'))
-        this.log(`  Recipient Address:   ${blue(flags.recipient)}`)
-        this.log(`  Token TxID (Hash):   ${blue(flags.tokenHash)}`)
-        this.log(`  Amount Transferred:  ${blue(flags.amount)}`)
+        this.log(green('\nTransaction Information (as signed):'))
+        this.log(`  Recipient Address:   ${blue(signedRecipient)}`)
+        this.log(`  Token TxID (Hash):   ${blue(signedTokenHash)}`)
+        this.log(`  Amount Transferred:  ${blue(signedAmount)}`)
+        this.log(`  Fee (Shor):          ${blue(signedFee)}`)
         this.log(`  Transaction TxID:    ${green(pushResHash)}`)
-        
+
         if (flags.json) {
           const jsonOut = {
-            recipient: flags.recipient,
-            tokenHash: flags.tokenHash,
-            amount: flags.amount,
+            recipient: signedRecipient,
+            tokenHash: signedTokenHash,
+            amount: signedAmount,
+            fee: signedFee,
             txhash: pushResHash,
             status: 'SUBMITTED'
           }
