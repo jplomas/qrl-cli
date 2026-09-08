@@ -37,6 +37,20 @@ jobs:
         env:
           QRL_TEST_OFFLINE: 'true'
 
+      # nyc writes coverage/lcov.info (see the "nyc" block in package.json). The tests spawn
+      # ./bin/run as a child process and nyc instruments those too, so this covers the command
+      # implementations and not just what mocha loads in-process.
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: theQRL/qrl-cli
+          files: ./coverage/lcov.info
+          disable_search: true
+          # Coverage reporting should never be what turns the build red, and the token is not
+          # available to pull requests from forks.
+          fail_ci_if_error: false
+
   release:
     name: Release
     needs: test
