@@ -30,7 +30,9 @@ describe('commands/dump-transactions', () => {
 
   it('should accept valid QRL address format', () => {
     // This is a basic format test - we're not testing actual network calls
-    const validAddress = 'Q01050034e5d0b1e3b3a4aa26b1e3c0b3a5f9f8c9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1'
+    // A real address (test/test-wallet/wallet.json). The previous literal was 77 characters,
+    // so this assertion could never have passed.
+    const validAddress = 'Q000300cc040d28c309c8e82d1397aa0d9b74666b492f77b485d327bf5496a725b7b8a3c024b9ee'
     
     // Test that the address is in the correct format (starts with Q and is 79 chars)
     assert(validAddress.length === 79, 'Valid QRL address should be 79 characters')

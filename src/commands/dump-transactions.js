@@ -4,10 +4,10 @@ const { red, white, black, green } = require('kleur')
 const ora = require('ora')
 const validateQrlAddress = require('@theqrl/validate-qrl-address')
 const fs = require('fs')
-const aes256 = require('aes256')
 const { cli } = require('cli-ux')
 const moment = require('moment')
 
+const aes = require('../utils/aes')
 const Qrlnode = require('../functions/grpc')
 
 const shorPerQuanta = 10 ** 9
@@ -17,14 +17,12 @@ const openWalletFile = (path) => {
   return JSON.parse(contents)[0]
 }
 
-const addressForAPI = (address) => {
-  return Buffer.from(address.substring(1), 'hex')
-}
+const addressForAPI = (address) => Buffer.from(address.substring(1), 'hex')
 
 // Sleep function for rate limiting
-const sleep = (ms) => {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
+const sleep = (ms) => new Promise(resolve => {
+  setTimeout(resolve, ms)
+})
 
 // Format transaction data for console output
 const formatTransactionForConsole = (tx, index) => {
@@ -151,7 +149,7 @@ class DumpTransactions extends Command {
             } else {
               password = await cli.prompt('Enter password for wallet file', { type: 'hide' })
             }
-            address = aes256.decrypt(password, walletJson.address)
+            address = aes.decrypt(password, walletJson.address)
             if (validateQrlAddress.hexString(address).result) {
               isValidFile = true
             } else {
