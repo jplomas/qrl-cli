@@ -11,6 +11,7 @@ const aes = require('../../utils/aes')
 
 const Qrlnode = require('../../functions/grpc')
 const { getNetworkSetup } = require('../../functions/network-helper')
+const { signBoundTransaction, ResponseBindingError } = require('../../functions/tx-binding')
 
 let QRLLIBLoaded = false
 
@@ -24,60 +25,6 @@ const waitForQRLLIB = (callBack) => {
     }
     return false
   }, 50)
-}
-
-const toUint8Vector = (arr) => {
-  const vec = new QRLLIB.Uint8Vector()
-  for (let i = 0; i < arr.length; i += 1) {
-    vec.push_back(arr[i])
-  }
-  return vec
-}
-
-function concatenateTypedArrays(resultConstructor, ...arrays) {
-  let totalLength = 0
-  arrays.forEach((arr) => {
-    totalLength += arr.length
-  })
-  // eslint-disable-next-line new-cap
-  const result = new resultConstructor(totalLength)
-  let offset = 0
-  arrays.forEach((arr) => {
-    result.set(arr, offset)
-    offset += arr.length
-  })
-  return result
-}
-
-function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
-  let input = i
-  if (!Number.isInteger(input)) {
-    input = parseInt(input, 10)
-  }
-
-  const byteArray = [0, 0, 0, 0, 0, 0, 0, 0]
-
-  for (let index = 0; index < byteArray.length; index += 1) {
-    // eslint-disable-next-line no-bitwise
-    const byte = input & 0xff
-    byteArray[index] = byte
-    input = (input - byte) / 256
-  }
-
-  byteArray.reverse()
-
-  if (bufferResponse === true) {
-    return Buffer.from(byteArray)
-  }
-  return new Uint8Array(byteArray)
-}
-
-function binaryToBytes(convertMe) {
-  const thisBytes = new Uint8Array(convertMe.size())
-  for (let i = 0; i < convertMe.size(); i += 1) {
-    thisBytes[i] = convertMe.get(i)
-  }
-  return thisBytes
 }
 
 const openWalletFile = (path) => {
@@ -377,37 +324,68 @@ class TokenCreate extends Command {
         this.exit(1)
       }
 
-      const spinnerSign = ora({ text: 'Signing transaction...' }).start()
-      let concatenatedArrays = concatenateTypedArrays(
-        Uint8Array,
-        Buffer.from('', 'hex'), // master_addr
-        toBigendianUint64BytesUnsigned(tokenTx.extended_transaction_unsigned.tx.fee),
-        Buffer.from(flags.symbol),
-        Buffer.from(flags.name),
-        Buffer.from(ownerAddress.substring(1), 'hex'),
-        toBigendianUint64BytesUnsigned(flags.decimals),
-      )
+      const spinnerSign = ora({ text: 'Verifying node response and signing transaction...' }).start()
 
-      const initialBalancesRaw = tokenTx.extended_transaction_unsigned.tx.token.initial_balances
-      initialBalancesRaw.forEach(item => {
-        concatenatedArrays = concatenateTypedArrays(Uint8Array, concatenatedArrays, item.address)
-        concatenatedArrays = concatenateTypedArrays(
-          Uint8Array,
-          concatenatedArrays,
-          toBigendianUint64BytesUnsigned(item.amount)
-        )
-      })
+      const returnedTx = tokenTx.extended_transaction_unsigned.tx
+      const returnedBalances = returnedTx.token.initial_balances
+      let signature
+      try {
+        // Preimage order is QRL core's TokenTransaction.get_data_bytes():
+        //   master_addr || fee || symbol || name || owner || decimals || (address || amount)*
+        // The initial balances decide who holds the new token's supply, so they are bound to
+        // the holders this command was asked for rather than taken from the node's response.
+        const bound = signBoundTransaction({
+          xmss: XMSS_OBJECT,
+          otsIndex: flags.otsindex,
+          publicKey: xmssPK,
+          parts: [
+            {
+              name: 'master address',
+              kind: 'bytes',
+              local: request.master_addr,
+              remote: returnedTx.master_addr,
+            },
+            { name: 'fee', kind: 'uint64', local: request.fee, remote: returnedTx.fee },
+            { name: 'token symbol', kind: 'bytes', local: request.symbol, remote: returnedTx.token.symbol },
+            { name: 'token name', kind: 'bytes', local: request.name, remote: returnedTx.token.name },
+            { name: 'token owner', kind: 'bytes', local: request.owner, remote: returnedTx.token.owner },
+            {
+              name: 'decimals',
+              kind: 'uint64',
+              local: request.decimals,
+              remote: returnedTx.token.decimals,
+            },
+            {
+              name: 'initial balances',
+              kind: 'pairs',
+              local: {
+                addresses: request.initial_balances.map(item => item.address),
+                amounts: request.initial_balances.map(item => item.amount),
+              },
+              remote: {
+                addresses: returnedBalances.map(item => item.address),
+                amounts: returnedBalances.map(item => item.amount),
+              },
+            },
+          ],
+        })
+        signature = bound.signature
+      } catch (err) {
+        if (err instanceof ResponseBindingError) {
+          spinnerSign.fail(`Refusing to sign: ${err.message}`)
+          this.log(red('\nThe node did not return the transaction that was requested.'))
+          this.log('Nothing was signed, no OTS key was used, and no token has been created.')
+          this.log('If this persists, connect to a different node with --grpc.')
+          this.exit(1)
+        }
+        spinnerSign.fail(`Failed to sign transaction: ${err.message}`)
+        this.exit(1)
+      }
 
-      const hashableBytes = toUint8Vector(concatenatedArrays)
-      const shaSum = QRLLIB.sha2_256(hashableBytes) // eslint-disable-line no-undef
+      returnedTx.signature = Buffer.from(signature)
+      returnedTx.public_key = Buffer.from(xmssPK)
 
-      XMSS_OBJECT.setIndex(parseInt(flags.otsindex, 10))
-      const signature = binaryToBytes(XMSS_OBJECT.sign(shaSum))
-
-      tokenTx.extended_transaction_unsigned.tx.signature = Buffer.from(signature)
-      tokenTx.extended_transaction_unsigned.tx.public_key = Buffer.from(xmssPK)
-
-      spinnerSign.succeed(`Transaction signed with OTS key ${flags.otsindex}`)
+      spinnerSign.succeed(`Node response matches the request. Transaction signed with OTS key ${flags.otsindex}`)
 
       const spinnerPush = ora({ text: 'Pushing signed transaction to network...' }).start()
       const pushRequest = {
@@ -422,18 +400,33 @@ class TokenCreate extends Command {
         }
         
         const pushResHash = Buffer.from(response.tx_hash).toString('hex')
+
+        // Read the values back off the signed transaction rather than echoing the flags, so the
+        // holders and fee that were actually committed to are the ones shown.
+        const signedHolders = returnedBalances.map(
+          item => `Q${Buffer.from(item.address).toString('hex')}: ${String(item.amount)}`
+        )
+
         spinnerPush.succeed(`Token created successfully!`)
-        this.log(green('\nTransaction Information:'))
-        this.log(`  Token Symbol:       ${blue(flags.symbol)}`)
-        this.log(`  Token Name:         ${blue(flags.name)}`)
-        this.log(`  Decimals:           ${blue(flags.decimals)}`)
+        this.log(green('\nTransaction Information (as signed):'))
+        this.log(`  Token Symbol:       ${blue(Buffer.from(returnedTx.token.symbol).toString())}`)
+        this.log(`  Token Name:         ${blue(Buffer.from(returnedTx.token.name).toString())}`)
+        this.log(`  Decimals:           ${blue(String(returnedTx.token.decimals))}`)
+        this.log(`  Fee (Shor):         ${blue(String(returnedTx.fee))}`)
+        this.log(`  Initial Holders:`)
+        signedHolders.forEach(holder => this.log(`    ${blue(holder)}`))
         this.log(`  Token Creation TxID: ${green(pushResHash)}`)
         
         if (flags.json) {
           const jsonOut = {
-            symbol: flags.symbol,
-            name: flags.name,
-            decimals: flags.decimals,
+            symbol: Buffer.from(returnedTx.token.symbol).toString(),
+            name: Buffer.from(returnedTx.token.name).toString(),
+            decimals: String(returnedTx.token.decimals),
+            fee: String(returnedTx.fee),
+            initialBalances: returnedBalances.map(item => ({
+              address: `Q${Buffer.from(item.address).toString('hex')}`,
+              amount: String(item.amount),
+            })),
             txhash: pushResHash,
             status: 'SUBMITTED'
           }

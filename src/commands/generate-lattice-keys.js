@@ -15,6 +15,7 @@ const aes = require('../utils/aes')
 const eccrypto = require('../utils/silent-eccrypto')
 const Qrlnode = require('../functions/grpc')
 const { getNetworkSetup } = require('../functions/network-helper')
+const { signBoundTransaction, ResponseBindingError } = require('../functions/tx-binding')
 
 let QRLLIBLoaded = false
 let DILLIBLoaded = false
@@ -62,14 +63,6 @@ const waitForKYBLIB = (callBack) => {
   }, 50)
 }
 
-const toUint8Vector = (arr) => {
-  const vec = new QRLLIB.Uint8Vector()
-  for (let i = 0; i < arr.length; i += 1) {
-    vec.push_back(arr[i])
-  }
-  return vec
-}
-
 // Convert bytes to hex
 function bytesToHex(byteArray) {
   return [...byteArray]
@@ -82,56 +75,8 @@ function bytesToHex(byteArray) {
 }
 
 // Concatenates multiple typed arrays into one.
-function concatenateTypedArrays(resultConstructor, ...arrays) {
-  /* eslint-disable */
-  let totalLength = 0
-  for (let arr of arrays) {
-    totalLength += arr.length
-  }
-  const result = new resultConstructor(totalLength)
-  let offset = 0
-  for (let arr of arrays) {
-    result.set(arr, offset)
-    offset += arr.length
-  }
-  /* eslint-enable */
-  return result
-}
-
 // Take input and convert to unsigned uint64 bigendian bytes
-function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
-  let input = i
-  if (!Number.isInteger(input)) {
-    input = parseInt(input, 10)
-  }
-
-  const byteArray = [0, 0, 0, 0, 0, 0, 0, 0]
-
-  for (let index = 0; index < byteArray.length; index += 1) {
-    const byte = input & 0xff // eslint-disable-line no-bitwise
-    byteArray[index] = byte
-    input = (input - byte) / 256
-  }
-
-  byteArray.reverse()
-
-  if (bufferResponse === true) {
-    const result = Buffer.from(byteArray)
-    return result
-  }
-  const result = new Uint8Array(byteArray)
-  return result
-}
-
 // Convert Binary object to Bytes
-function binaryToBytes(convertMe) {
-  const thisBytes = new Uint8Array(convertMe.size())
-  for (let i = 0; i < convertMe.size(); i += 1) {
-    thisBytes[i] = convertMe.get(i)
-  }
-  return thisBytes
-}
-
 const openWalletFile = (path) => {
   const contents = fs.readFileSync(path)
   return JSON.parse(contents)[0]
@@ -356,37 +301,52 @@ class Lattice extends Command {
             const tx = await Qrlnetwork.api('GetLatticeTxn', request)
             spinner.succeed('Node correctly returned transaction for signing')
             const spinner2 = ora({ text: 'Signing transaction...' }).start()
-            const concatenatedArrays = concatenateTypedArrays(
-              Uint8Array,
-              Buffer.from('', 'hex'), // master_address
-              toBigendianUint64BytesUnsigned(tx.extended_transaction_unsigned.tx.fee), // fee
-              kyberPK, // kyber pub key
-              dilithiumPK, // dilithium pub key
-              ecdsaPK // ecdsa public key
-            )
-
-            // Convert Uint8Array to VectorUChar
-            const hashableBytes = toUint8Vector(concatenatedArrays)
-
-            // Create sha256 sum of concatenated array
-            const shaSum = QRLLIB.sha2_256(hashableBytes)
-
-            XMSS_OBJECT.setIndex(parseInt(flags.otsindex, 10))
-            const signature = binaryToBytes(XMSS_OBJECT.sign(shaSum))
-            // Calculate transaction hash
-            const txnHashConcat = concatenateTypedArrays(Uint8Array, binaryToBytes(shaSum), signature, xmssPK)
-            // tx hash bytes..
-            const txnHashableBytes = toUint8Vector(txnHashConcat)
-            // get the transaction hash
-            const txnHash = QRLLIB.bin2hstr(QRLLIB.sha2_256(txnHashableBytes))
-            spinner2.succeed(`Transaction signed with OTS key ${flags.otsindex}. (nodes will reject this transaction if key reuse is detected)`)
+            // Preimage order is QRL core's LatticeTransaction.get_data_bytes():
+            //   master_addr || fee || pk1 || pk2 || pk3
+            // The fee was the only field taken from the response; the three public keys are
+            // ours and are now compared against the response as well.
+            const returnedTx = tx.extended_transaction_unsigned.tx
+            let signature
+            let txnHash
+            try {
+              const bound = signBoundTransaction({
+                xmss: XMSS_OBJECT,
+                otsIndex: flags.otsindex,
+                publicKey: xmssPK,
+                parts: [
+                  {
+                    name: 'master address',
+                    kind: 'bytes',
+                    local: Buffer.from('', 'hex'),
+                    remote: returnedTx.master_addr,
+                  },
+                  { name: 'fee', kind: 'uint64', local: fee, remote: returnedTx.fee },
+                  { name: 'kyber public key', kind: 'bytes', local: kyberPK, remote: returnedTx.latticePK.pk1 },
+                  { name: 'dilithium public key', kind: 'bytes', local: dilithiumPK, remote: returnedTx.latticePK.pk2 },
+                  { name: 'ecdsa public key', kind: 'bytes', local: ecdsaPK, remote: returnedTx.latticePK.pk3 },
+                ],
+              })
+              signature = bound.signature
+              txnHash = bound.txnHash
+            } catch (err) {
+              if (err instanceof ResponseBindingError) {
+                spinner2.fail(`Refusing to sign: ${err.message}`)
+                this.log(`${red('⨉')} The node did not return the transaction that was requested.`)
+                this.log('Nothing was signed and no OTS key was used.')
+                this.log('If this persists, connect to a different node with --grpc.')
+                this.exit(1)
+              }
+              spinner2.fail(`Failed to sign transaction: ${err.message}`)
+              this.exit(1)
+            }
+            spinner2.succeed(`Node response matches the request. Transaction signed with OTS key ${flags.otsindex}. (nodes will reject this transaction if key reuse is detected)`)
             const spinner3 = ora({ text: 'Pushing transaction to node...' }).start()
             // transaction sig and pub key into buffer
-            tx.extended_transaction_unsigned.tx.signature = Buffer.from(signature)
-            tx.extended_transaction_unsigned.tx.public_key = Buffer.from(xmssPK) // eslint-disable-line camelcase
+            returnedTx.signature = Buffer.from(signature)
+            returnedTx.public_key = Buffer.from(xmssPK) // eslint-disable-line camelcase
 
             const pushTransactionReq = {
-              transaction_signed: tx.extended_transaction_unsigned.tx, // eslint-disable-line camelcase
+              transaction_signed: returnedTx, // eslint-disable-line camelcase
             }
             // push the transaction to the network
            const response = await Qrlnetwork.api('PushTransaction', pushTransactionReq)
