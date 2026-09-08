@@ -49,7 +49,7 @@ function concatenateTypedArrays(resultConstructor, ...arrays) {
 // NOTE: the `parseInt` narrows through a double, so values above 2^53 Shor cannot be encoded
 // exactly. That is pre-existing and is *not* a binding weakness — comparison below is exact
 // (BigInt) and rejects any difference this encoding would otherwise hide.
-function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
+function toBigendianUint64BytesUnsigned(i) {
   let input = i
   if (!Number.isInteger(input)) {
     input = parseInt(input, 10)
@@ -66,9 +66,6 @@ function toBigendianUint64BytesUnsigned(i, bufferResponse = false) {
 
   byteArray.reverse()
 
-  if (bufferResponse === true) {
-    return Buffer.from(byteArray)
-  }
   return new Uint8Array(byteArray)
 }
 

@@ -357,3 +357,94 @@ describe('tx-binding: the signed bytes come from the request, not the response',
     assert.strictEqual(signCalls, 0)
   })
 })
+
+describe('tx-binding: malformed input from either side', () => {
+  // These are the paths a hostile node reaches by sending something that is not merely a
+  // different value but a different shape. Each must fail closed rather than coerce.
+
+  it('treats an absent bytes field as empty rather than skipping the check', () => {
+    // protobuf with defaults:true gives an empty buffer for an unset bytes field. A node that
+    // drops the field entirely must not thereby escape comparison.
+    assertRefuses(
+      transferTokenParts({master_addr: undefined}).map(p => (p.name === 'master address'
+        ? {...p, local: MALLORY}
+        : p)),
+      'master address'
+    )
+  })
+
+  it('accepts the byte-array shapes protobuf can hand back', () => {
+    installStubQRLLIB()
+    const asArray = Array.from(ALICE)
+    const asTyped = new Uint8Array(ALICE)
+    assert.doesNotThrow(() => boundBytesFor({name: 'a', kind: 'bytes', local: ALICE, remote: asArray}))
+    assert.doesNotThrow(() => boundBytesFor({name: 'a', kind: 'bytes', local: ALICE, remote: asTyped}))
+  })
+
+  it('rejects a bytes field that is not bytes at all', () => {
+    assert.throws(
+      () => boundBytesFor({name: 'recipient', kind: 'bytes', local: ALICE, remote: {evil: true}}),
+      err => err instanceof ResponseBindingError && /unsupported bytes value/.test(err.message)
+    )
+  })
+
+  it('rejects a missing uint64 rather than treating it as zero', () => {
+    assertRefuses(transferTokenParts({fee: undefined}), 'missing fee')
+  })
+
+  it('rejects a mismatched amount count', () => {
+    assertRefuses(
+      transferTokenParts({addrs_to: [ALICE], amounts: ['1', '7']}),
+      'transfer amount count'
+    )
+  })
+
+  it('rejects a request whose own addresses and amounts disagree', () => {
+    // Not an attack — a bug in the calling command. It must still stop before signing.
+    installStubQRLLIB()
+    const parts = transferTokenParts().map(p => (p.kind === 'pairs'
+      ? {...p, local: {addresses: [ALICE, MALLORY], amounts: [1]}}
+      : p))
+    assert.throws(
+      () => sign(parts),
+      err => err instanceof ResponseBindingError && /2 addresses but 1 amounts were requested/.test(err.message)
+    )
+    assert.strictEqual(signCalls, 0)
+  })
+
+  it('rejects an unknown preimage part kind', () => {
+    // Guards against a future command describing its preimage with a typo and silently
+    // signing a digest that is missing a field.
+    assert.throws(
+      () => boundBytesFor({name: 'mystery', kind: 'uint32', local: 1, remote: 1}),
+      err => err instanceof ResponseBindingError && /unknown preimage part kind: uint32/.test(err.message)
+    )
+  })
+})
+
+describe('tx-binding: signBoundTransaction output', () => {
+  it('returns the signature, the digest, the preimage and the transaction hash', () => {
+    installStubQRLLIB()
+    const result = sign(transferTokenParts())
+    assert.ok(result.signature instanceof Uint8Array)
+    assert.ok(result.preimage instanceof Uint8Array)
+    assert.strictEqual(typeof result.txnHash, 'string')
+    assert.ok(result.shaSum)
+  })
+
+  it('signs with the OTS index it was given', () => {
+    installStubQRLLIB()
+    const xmss = makeXmss()
+    signBoundTransaction({parts: transferTokenParts(), xmss, otsIndex: '42', publicKey: PUBLIC_KEY})
+    assert.strictEqual(xmss.index, 42, 'the index is applied, and parsed from a string flag')
+  })
+
+  it('builds the preimage in the declared part order', () => {
+    installStubQRLLIB()
+    const {preimage} = sign(transferTokenParts())
+    // master_addr(0) || fee(8) || token_txhash(32) || address(39) || amount(8)
+    assert.strictEqual(preimage.length, 0 + 8 + 32 + ALICE.length + 8)
+    assert.ok(Buffer.from(preimage).includes(TOKEN_HASH))
+    assert.ok(Buffer.from(preimage).includes(ALICE))
+  })
+})
