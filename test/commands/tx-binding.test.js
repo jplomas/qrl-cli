@@ -52,6 +52,17 @@ function makeVector(bytes) {
   }
 }
 
+// Nothing else in this suite runs QRLLIB in-process — the other tests spawn ./bin/run as a
+// child. Save and restore the global anyway, so this file stays self-contained if that
+// changes.
+let realQRLLIB
+before(() => {
+  realQRLLIB = global.QRLLIB
+})
+after(() => {
+  global.QRLLIB = realQRLLIB
+})
+
 function installStubQRLLIB() {
   signCalls = 0
   global.QRLLIB = {
