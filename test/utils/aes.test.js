@@ -67,7 +67,7 @@ describe('utils/aes', () => {
       // property the legacy CTR format did not have.
       const parts = aes.encrypt(PASSWORD, SEED).split(':')
       const ciphertext = Buffer.from(parts[4], 'base64')
-      ciphertext[0] ^= 0xff
+      ciphertext[0] = (ciphertext[0] + 1) % 256
       parts[4] = ciphertext.toString('base64')
       assert.throws(() => aes.decrypt(PASSWORD, parts.join(':')), /Decryption failed/)
     })
@@ -75,7 +75,7 @@ describe('utils/aes', () => {
     it('fails closed on a tampered auth tag', () => {
       const parts = aes.encrypt(PASSWORD, SEED).split(':')
       const tag = Buffer.from(parts[3], 'base64')
-      tag[0] ^= 0xff
+      tag[0] = (tag[0] + 1) % 256
       parts[3] = tag.toString('base64')
       assert.throws(() => aes.decrypt(PASSWORD, parts.join(':')), /Decryption failed/)
     })

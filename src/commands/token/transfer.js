@@ -158,8 +158,12 @@ class TokenTransfer extends Command {
     let address = ''
     if (flags.wallet) {
       let isValidFile = false
-      const walletJson = openWalletFile(flags.wallet)
+      let walletJson
       try {
+        // Inside the try: a missing or malformed file must reach the "invalid wallet file"
+        // message below, not escape as an unhandled ENOENT from readFileSync or a SyntaxError
+        // from JSON.parse.
+        walletJson = openWalletFile(flags.wallet)
         if (walletJson.encrypted === false) {
           isValidFile = true
           address = walletJson.address
