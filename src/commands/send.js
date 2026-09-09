@@ -16,19 +16,25 @@ const { signBoundTransaction, ResponseBindingError } = require('../functions/tx-
 
 let QRLLIBLoaded = false
 
-const waitForQRLLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the QRLLIB object has the str2bin function.
-    // This is sufficient to tell us QRLLIB has loaded.
-    if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
-      callBack()
-    } else {
-      QRLLIBLoaded = true
-      return waitForQRLLIB(callBack)
+// Resolves once QRLLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForQRLLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the QRLLIB object has the str2bin function.
+        // This is sufficient to tell us QRLLIB has loaded.
+        if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          QRLLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
 const shorPerQuanta = 10 ** 9
 
@@ -141,11 +147,15 @@ class Send extends Command {
           message: 'Enter amount to send (in Quanta, or Shor if -s flag is set):',
           validate: value => value > 0 ? true : 'Quantity must be positive'
         })
-        args.quantity = response.quantity.toString()
-        if (!args.quantity) {
+        // Checked before the conversion, not after. Two answers mean "no answer": a
+        // cancelled prompt returns nothing at all, and a blank submission returns an
+        // empty string, which the `>= 0` validator lets through as 0. Calling toString()
+        // on the first threw a TypeError one line ahead of the check meant to catch it.
+        if (response.quantity === undefined || response.quantity === '') {
           this.log(`${red('⨉')} Operation cancelled.`)
           this.exit(1)
         }
+        args.quantity = response.quantity.toString()
       }
 
       if (!flags.otsindex) {
@@ -159,11 +169,15 @@ class Send extends Command {
           message: 'Enter OTS key index (e.g. 0):',
           validate: value => value >= 0 ? true : 'OTS index must be 0 or greater'
         })
-        flags.otsindex = response.otsindex.toString()
-        if (!flags.otsindex) {
+        // Checked before the conversion, not after. Two answers mean "no answer": a
+        // cancelled prompt returns nothing at all, and a blank submission returns an
+        // empty string, which the `>= 0` validator lets through as 0. Calling toString()
+        // on the first threw a TypeError one line ahead of the check meant to catch it.
+        if (response.otsindex === undefined || response.otsindex === '') {
           this.log(`${red('⨉')} Operation cancelled.`)
           this.exit(1)
         }
+        flags.otsindex = response.otsindex.toString()
       }
 
       if (!flags.wallet && !flags.hexseed) {
@@ -246,6 +260,10 @@ class Send extends Command {
     if (flags.loadfromfile) {
       sendMethods += 1
     }
+    // Defensively unreachable: with no -F, the earlier gate exits (non-interactive) or the
+    // prompt sets flags.recipient / exits (interactive), so at least one send method is always
+    // set by the time we get here. Kept as a guard for future internal callers of this path.
+    /* istanbul ignore if */
     if (sendMethods === 0) {
       this.log(`${red('⨉')} Unable to send: no recipients`)
       this.exit(1)
@@ -264,6 +282,10 @@ class Send extends Command {
         this.exit(1)
       }
     }
+    // Defensively unreachable: the same condition is already handled above — non-interactively
+    // it exits with "Missing sender wallet file", interactively the prompt sets one of them or
+    // exits. Kept as a guard for future internal callers of this path.
+    /* istanbul ignore if */
     if (!flags.wallet && !flags.hexseed && !flags.loadfromfile) {
       this.log(`${red('⨉')} Unable to send: no wallet json file, transaction file or hexseed specified`)
       this.exit(1)
@@ -327,6 +349,7 @@ class Send extends Command {
     let address = ''
     if (flags.wallet) {
       let isValidFile = false
+      let badPassword = false
       let walletJson
       try {
         // Inside the try: a missing or malformed file must reach the "invalid wallet file"
@@ -345,17 +368,26 @@ class Send extends Command {
           } else {
             password = await cli.prompt('Enter password for wallet file', { type: 'hide' })
           }
-          address = aes.decrypt(password, walletJson.address)
-          hexseed = aes.decrypt(password, walletJson.hexseed)
-          if (validateQrlAddress.hexString(address).result) {
-            isValidFile = true
-          } else {
-            this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
-            this.exit(1)
+          // Two ways a wrong password shows up: the v2 format is authenticated, so decryption
+          // throws, and the legacy format is not, so it decrypts to nonsense that fails the
+          // address check. Both mean the password is wrong rather than the file. Reporting it
+          // from inside this try used to be swallowed by the catch below, which then printed
+          // "invalid wallet file" on top of it - two contradictory messages for one mistake.
+          try {
+            address = aes.decrypt(password, walletJson.address)
+            hexseed = aes.decrypt(password, walletJson.hexseed)
+            isValidFile = validateQrlAddress.hexString(address).result
+          } catch (error) {
+            isValidFile = false
           }
+          badPassword = !isValidFile
         }
       } catch (error) {
         isValidFile = false
+      }
+      if (badPassword) {
+        this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
+        this.exit(1)
       }
       if (!isValidFile) {
         this.log(`${red('⨉')} Unable to open wallet file: invalid wallet file`)
@@ -390,15 +422,17 @@ class Send extends Command {
         this.exit(1)
       }
     }
-    let fee = 0 // default fee 100 Shor
+    let fee = 0 // default fee 0 Shor
     if (flags.fee) {
       const passedFee = parseInt(flags.fee, 10)
-      if (passedFee) {
-        fee = passedFee
-      } else {
+      // Rejected on being unusable, not on being falsy: parseInt('0') is 0, and a zero
+      // fee is both legal on the network and what this command uses when -f is omitted.
+      // Testing truthiness sent an explicit -f 0 down the "invalid" path.
+      if (Number.isNaN(passedFee) || passedFee < 0) {
         this.log(`${red('⨉')} Fee is invalid`)
         this.exit(1)
       }
+      fee = passedFee
     }
     const thisAddressesTo = []
     const thisAmounts = []
@@ -415,14 +449,22 @@ class Send extends Command {
     
     text = flags.savetofile ? 'QRLLIB loading...' : 'Sending unsigned transaction to node...'
     const spinner = ora({ text }).start()
-    waitForQRLLIB(async () => {
+    await waitForQRLLIB(async () => {
       let XMSS_OBJECT
       let xmssPK
       if (!flags.loadfromfile) {
-        if (hexseed.match(' ') === null) {
-          XMSS_OBJECT = await new QRLLIB.Xmss.fromHexSeed(hexseed)
-        } else {
-          XMSS_OBJECT = await new QRLLIB.Xmss.fromMnemonic(hexseed)
+        // QRLLIB throws an emscripten pointer (a bare number), not an Error, so there is no
+        // message to relay and nothing useful to show the user. Without this catch the command
+        // exited non-zero having printed nothing at all.
+        try {
+          if (hexseed.match(' ') === null) {
+            XMSS_OBJECT = await new QRLLIB.Xmss.fromHexSeed(hexseed)
+          } else {
+            XMSS_OBJECT = await new QRLLIB.Xmss.fromMnemonic(hexseed)
+          }
+        } catch (err) {
+          spinner.fail('Failed to recreate XMSS wallet object: invalid hexseed or mnemonic')
+          this.exit(1)
         }
         xmssPK = Buffer.from(XMSS_OBJECT.getPK(), 'hex')
       }
@@ -641,13 +683,7 @@ class Send extends Command {
         }
         const response = await Qrlnetwork.api('PushTransaction', pushTransactionReq)
         if (response.error_code && response.error_code !== 'SUBMITTED') {
-          let errorMessage = 'unknown error'
-          if (response.error_code) {
-            errorMessage = `Unable send push transaction [error: ${response.error_description}`
-          } else {
-            errorMessage = `Node rejected signed message: has OTS key ${flags.otsindex} been reused?`
-          }
-          spinner3.fail(`${errorMessage}]`)
+          spinner3.fail(`Unable send push transaction [error: ${response.error_description}]`)
           this.exit(1)
         }
         const pushTransactionRes = JSON.stringify(response.tx_hash)
@@ -756,7 +792,7 @@ Send.flags = {
   fee: flags.string({
     char: 'f',
     required: false,
-    description: 'Fee for transaction in Shor (defaults to 100 Shor)'
+    description: 'Fee for transaction in Shor (defaults to 0 Shor)'
   }),
 
   file: flags.string({

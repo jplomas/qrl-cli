@@ -197,9 +197,14 @@ class ListTransactions extends Command {
       let isFile = false
       let isValidFile = false
       const path = address
+      let walletJson
+      // The read belongs inside the try: existsSync says yes to anything on disk, including a
+      // directory, and reading one throws. Left outside, that escaped as a raw EISDIR instead
+      // of the message below.
       try {
         if (fs.existsSync(path)) {
           isFile = true
+          walletJson = openWalletFile(path)
         }
       } catch (error) {
         this.log(`${red('⨉')} Unable to list transactions: invalid QRL address/wallet file - ${error.message}`)
@@ -209,7 +214,6 @@ class ListTransactions extends Command {
         this.log(`${red('⨉')} Unable to list transactions: invalid QRL address/wallet file`)
         this.exit(1)
       } else {
-        const walletJson = openWalletFile(path)
         try {
           if (walletJson.encrypted === false) {
             isValidFile = true
@@ -414,33 +418,29 @@ class ListTransactions extends Command {
               estimatedPages = currentPage
             } else {
               currentPage += 1
-              // Rate limiting: 5 second pause between pages
-              if (hasMorePages) {
-                let countdown = 5
-                let pauseSpinner
-                if (!flags.json) {
-                  pauseSpinner = ora({ 
-                    text: `${white('Pausing')} ${green(countdown.toString())} ${white('seconds to respect API limits...')}` 
-                  }).start()
-                }
-                
-                const countdownInterval = setInterval(() => {
-                  countdown -= 1
-                  if (pauseSpinner) {
-                    if (countdown > 0) {
-                      pauseSpinner.text = `${white('Pausing')} ${green(countdown.toString())} ${white('seconds to respect API limits...')}`
-                    } else {
-                      clearInterval(countdownInterval)
-                      pauseSpinner.succeed('Ready for next page')
-                    }
-                  } else if (countdown <= 0) {
-                    clearInterval(countdownInterval)
-                  }
-                }, 1000)
-                
-                // eslint-disable-next-line no-await-in-loop
-                await sleep(5000)
-              }
+              // Rate limiting: 5 second pause between pages. Only reached while there are
+              // more pages to fetch, and only when --json is off - this whole arm lives
+              // inside `if (fetchSpinner)`, which is the same condition - so neither needs
+              // rechecking here.
+              let countdown = 5
+              const pauseSpinner = ora({
+                text: `${white('Pausing')} ${green(countdown.toString())} ${white('seconds to respect API limits...')}`
+              }).start()
+
+              // The ticker only counts down; the sleep below owns finishing it. Letting the
+              // final tick do that raced the sleep - both are due at 5000ms - so the
+              // interval could outlive the pause and print into whatever came next.
+              const countdownInterval = setInterval(() => {
+                countdown -= 1
+                pauseSpinner.text =
+                  `${white('Pausing')} ${green(Math.max(countdown, 0).toString())} ` +
+                  `${white('seconds to respect API limits...')}`
+              }, 1000)
+
+              // eslint-disable-next-line no-await-in-loop
+              await sleep(5000)
+              clearInterval(countdownInterval)
+              pauseSpinner.succeed('Ready for next page')
             }
           } else if (response.transactions_detail.length < itemsPerPage) {
             hasMorePages = false

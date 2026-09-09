@@ -59,9 +59,14 @@ class Balance extends Command {
       let isFile = false
       let isValidFile = false
       const path = address
+      let walletJson
+      // The read belongs inside the try: existsSync says yes to anything on disk, including a
+      // directory, and reading one throws. Left outside, that escaped as a raw EISDIR instead
+      // of the message below.
       try {
         if (fs.existsSync(path)) {
           isFile = true
+          walletJson = openWalletFile(path)
         }
       } catch (error) {
         this.log(`${red('⨉')} Unable to get a balance: invalid QRL address/wallet file`)
@@ -71,7 +76,6 @@ class Balance extends Command {
         this.log(`${red('⨉')} Unable to get a balance: invalid QRL address/wallet file`)
         this.exit(1)
       } else {
-        const walletJson = openWalletFile(path)
         try {
           if (walletJson.encrypted === false) {
             isValidFile = true
@@ -93,6 +97,10 @@ class Balance extends Command {
             }
           }
         } catch (error) {
+          // The v2 wallet format is authenticated, so a wrong password makes decryption
+          // throw rather than return nonsense. Swallowing it here exited 1 with nothing
+          // printed at all - no hint that the password was the problem.
+          this.log(`${red('⨉')} Error decrypting wallet: ${error.message}`)
           this.exit(1)
         }
         if (!flags.json) {

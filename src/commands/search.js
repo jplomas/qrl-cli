@@ -75,6 +75,9 @@ class Search extends Command {
       grpcEndpoint = 'mainnet-3.automated.theqrl.org:19009'
       network = 'Mainnet'
     }
+    // Unreachable: `search` is declared as a required argument, and oclif rejects a missing or
+    // empty value before run() is entered. Kept as a guard for any future non-oclif caller.
+    /* istanbul ignore if */
     if (!args.search) {
       this.log(`${red('⨉')} No search string`)
       this.exit(1)
