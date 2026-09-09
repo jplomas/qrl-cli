@@ -59,21 +59,27 @@ class CreateWallet extends Command {
       return b32Encode(descriptorAndHash)
     }
 
-    const waitForQRLLIB = callBack => {
-      setTimeout(() => {
-        // Test the QRLLIB object has the str2bin function.
-        // This is sufficient to tell us QRLLIB has loaded.
-        if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
-          callBack()
-        } else {
-          QRLLIBLoaded = true
-          return waitForQRLLIB(callBack)
+    // Resolves once QRLLIB has loaded *and* `callBack` has run to completion, so run() can
+    // await the work instead of returning while it is still going. Without that, a this.exit()
+    // inside the callback surfaces as an unhandled rejection rather than an exit code.
+    const waitForQRLLIB = callBack =>
+      new Promise((resolve, reject) => {
+        const poll = () => {
+          setTimeout(() => {
+            // Test the QRLLIB object has the str2bin function.
+            // This is sufficient to tell us QRLLIB has loaded.
+            if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
+              Promise.resolve().then(callBack).then(resolve, reject)
+            } else {
+              QRLLIBLoaded = true
+              poll()
+            }
+          }, 50)
         }
-        return false
-      }, 50)
-    }
+        poll()
+      })
 
-    waitForQRLLIB(async () => {
+    await waitForQRLLIB(async () => {
       // default to a tree height of 10 unless passed via CLI
       let xmssHeight = 10
       if (flags.height) {

@@ -72,12 +72,10 @@ function loadGrpcBaseProto(grpcEndpoint) {
         prefix: 'qrl-',
         postfix: '.proto',
       }).name
-      writeFile(qrlProtoFilePath, res.grpcProto).then((fsErr) => {
-        if (fsErr) {
-          return null
-        }
-        return true
-      })
+      // Awaited: the caller reads this file back to check its hash, so returning the path
+      // before the write lands is a race. A failed write rejects here rather than being
+      // reported through a callback argument a promise never passes.
+      await writeFile(qrlProtoFilePath, res.grpcProto)
       return qrlProtoFilePath
   })
 }
@@ -117,6 +115,10 @@ async function loadGrpcProto(protofile, endpoint) {
 
 async function makeClient(grpcEndpoint) {
   const proto = await loadGrpcBaseProto(grpcEndpoint)
+  // Defensive: loadGrpcBaseProto either rejects or resolves the name of a temp file it just
+  // created, which is never empty, so the else can't be reached through this module's only
+  // caller. The guard stays for any future path that resolves without a file.
+  /* istanbul ignore else */
   if (proto) {
     const validHash = await checkProtoHash(proto)
     if (validHash) {

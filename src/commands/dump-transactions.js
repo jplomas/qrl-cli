@@ -124,9 +124,14 @@ class DumpTransactions extends Command {
       let isFile = false
       let isValidFile = false
       const path = address
+      let walletJson
+      // The read belongs inside the try: existsSync says yes to anything on disk, including a
+      // directory, and reading one throws. Left outside, that escaped as a raw EISDIR instead
+      // of the message below.
       try {
         if (fs.existsSync(path)) {
           isFile = true
+          walletJson = openWalletFile(path)
         }
       } catch (error) {
         this.log(`${red('⨉')} Unable to dump transactions: invalid QRL address/wallet file - ${error.message}`)
@@ -136,7 +141,6 @@ class DumpTransactions extends Command {
         this.log(`${red('⨉')} Unable to dump transactions: invalid QRL address/wallet file`)
         this.exit(1)
       } else {
-        const walletJson = openWalletFile(path)
         try {
           if (walletJson.encrypted === false) {
             isValidFile = true
@@ -247,13 +251,12 @@ class DumpTransactions extends Command {
             hasMorePages = false
           } else {
             currentPage += 1
-            // Rate limiting: 5 second pause between pages
-            if (hasMorePages) {
-              const pauseSpinner = ora({ text: 'Pausing 5 seconds to avoid hitting API limits...' }).start()
-              // eslint-disable-next-line no-await-in-loop
-              await sleep(5000)
-              pauseSpinner.succeed('Pause completed')
-            }
+            // Rate limiting: 5 second pause between pages. This arm is only reached while
+            // there are more pages to fetch, so no further check is needed.
+            const pauseSpinner = ora({ text: 'Pausing 5 seconds to avoid hitting API limits...' }).start()
+            // eslint-disable-next-line no-await-in-loop
+            await sleep(5000)
+            pauseSpinner.succeed('Pause completed')
           }
         } else {
           hasMorePages = false

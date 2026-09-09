@@ -21,47 +21,65 @@ let QRLLIBLoaded = false
 let DILLIBLoaded = false
 let KYBLIBLoaded = false
 
-const waitForQRLLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the QRLLIB object has the str2bin function.
-    // This is sufficient to tell us QRLLIB has loaded.
-    if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
-      callBack()
-    } else {
-      QRLLIBLoaded = true
-      return waitForQRLLIB(callBack)
+// Resolves once QRLLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForQRLLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the QRLLIB object has the str2bin function.
+        // This is sufficient to tell us QRLLIB has loaded.
+        if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          QRLLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
-const waitForDILLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the DILLIB object has the getString function.
-    // This is sufficient to tell us DILLIB has loaded.
-    if (typeof DILLIB.getString === 'function' && DILLIBLoaded === true) {
-      callBack()
-    } else {
-      DILLIBLoaded = true
-      return waitForDILLIB(callBack)
+// Resolves once DILLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForDILLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the DILLIB object has the getString function.
+        // This is sufficient to tell us DILLIB has loaded.
+        if (typeof DILLIB.getString === 'function' && DILLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          DILLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
-const waitForKYBLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the KYBLIB object has the getString function.
-    // This is sufficient to tell us KYBLIB has loaded.
-    if (typeof KYBLIB.getString === 'function' && KYBLIBLoaded === true) {
-      callBack()
-    } else {
-      KYBLIBLoaded = true
-      return waitForKYBLIB(callBack)
+// Resolves once KYBLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForKYBLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the KYBLIB object has the getString function.
+        // This is sufficient to tell us KYBLIB has loaded.
+        if (typeof KYBLIB.getString === 'function' && KYBLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          KYBLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
 // Convert bytes to hex
 function bytesToHex(byteArray) {
@@ -101,6 +119,7 @@ class Lattice extends Command {
     // open wallet file
     if (flags.wallet) {
       let isValidFile = false
+      let badPassword = false
       let walletJson
       try {
         // Inside the try: a missing or malformed file must reach the "invalid wallet file"
@@ -119,17 +138,26 @@ class Lattice extends Command {
           } else {
             password = await cli.prompt('Enter password for wallet file', { type: 'hide' })
           }
-          address = aes.decrypt(password, walletJson.address)
-          hexseed = aes.decrypt(password, walletJson.hexseed)
-          if (validateQrlAddress.hexString(address).result) {
-            isValidFile = true
-          } else {
-            this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
-            this.exit(1)
+          // Two ways a wrong password shows up: the v2 format is authenticated, so decryption
+          // throws, and the legacy format is not, so it decrypts to nonsense that fails the
+          // address check. Both mean the password is wrong rather than the file. Reporting it
+          // from inside this try used to be swallowed by the catch below, which then printed
+          // "invalid wallet file" on top of it - two contradictory messages for one mistake.
+          try {
+            address = aes.decrypt(password, walletJson.address)
+            hexseed = aes.decrypt(password, walletJson.hexseed)
+            isValidFile = validateQrlAddress.hexString(address).result
+          } catch (error) {
+            isValidFile = false
           }
+          badPassword = !isValidFile
         }
       } catch (error) {
         isValidFile = false
+      }
+      if (badPassword) {
+        this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
+        this.exit(1)
       }
       if (!isValidFile) {
         this.log(`${red('⨉')} Unable to open wallet file: invalid wallet file`)
@@ -178,26 +206,36 @@ class Lattice extends Command {
     }
 
     // set the fee to default or flag
-    let fee = 0 // default fee 100 Shor
+    let fee = 0 // default fee 0 Shor
     if (flags.fee) {
       const passedFee = parseInt(flags.fee, 10)
-      if (passedFee) {
-        fee = passedFee
-      } else {
+      // Rejected on being unusable, not on being falsy: parseInt('0') is 0, and a zero
+      // fee is both legal on the network and what this command uses when -f is omitted.
+      // Testing truthiness sent an explicit -f 0 down the "invalid" path.
+      if (Number.isNaN(passedFee) || passedFee < 0) {
         this.log(`${red('⨉')} Fee is invalid`)
         this.exit(1)
       }
+      fee = passedFee
     }
 
     // create the keys
     const spinner = ora({text: 'Creating Crystals Keys...'}).start()
-    waitForQRLLIB(async () => {
+    await waitForQRLLIB(async () => {
       // get the xmss pub key to send from
       let XMSS_OBJECT
-      if (hexseed.match(' ') === null) {
-        XMSS_OBJECT = await new QRLLIB.Xmss.fromHexSeed(hexseed)
-      } else {
-        XMSS_OBJECT = await new QRLLIB.Xmss.fromMnemonic(hexseed)
+      // QRLLIB throws an emscripten pointer (a bare number), not an Error, so there is no
+      // message to relay and nothing useful to show the user. Without this catch the command
+      // exited non-zero having printed nothing at all.
+      try {
+        if (hexseed.match(' ') === null) {
+          XMSS_OBJECT = await new QRLLIB.Xmss.fromHexSeed(hexseed)
+        } else {
+          XMSS_OBJECT = await new QRLLIB.Xmss.fromMnemonic(hexseed)
+        }
+      } catch (err) {
+        spinner.fail('Failed to recreate XMSS wallet object: invalid hexseed or mnemonic')
+        this.exit(1)
       }
       const xmssPK = Buffer.from(XMSS_OBJECT.getPK(), 'hex')
       spinner.succeed('XMSS Key')
@@ -208,14 +246,14 @@ class Lattice extends Command {
       const ecdsaPK = Buffer.from(publicKey)
       spinner.succeed('ECDSA PK created')
       
-      waitForKYBLIB(async () => {
+      await waitForKYBLIB(async () => {
         // new kyber keys
         const KYB_OBJECT = await new KYBLIB.Kyber.empty()
         const kyberPK = Buffer.from(KYB_OBJECT.getPK(), 'hex')
         const kyberSK = Buffer.from(KYB_OBJECT.getSK(), 'hex')
         spinner.succeed('Kyber Keys Created!')
 
-        waitForDILLIB(async () => {
+        await waitForDILLIB(async () => {
           // new dilithium keys
           const DIL_OBJECT = await new DILLIB.Dilithium.empty()
           const dilithiumPK = Buffer.from(DIL_OBJECT.getPK(), 'hex')
@@ -356,13 +394,7 @@ class Lattice extends Command {
            const response = await Qrlnetwork.api('PushTransaction', pushTransactionReq)
            // this.log(`response: ${response}`)
             if (response.error_code && response.error_code !== 'SUBMITTED') {
-              let errorMessage = 'unknown error'
-              if (response.error_code) {
-                errorMessage = `Unable send push transaction [error: ${response.error_description}`
-              } else {
-                errorMessage = `Node rejected signed message: has OTS key ${flags.otsindex} been reused?`
-              }
-              spinner3.fail(`${errorMessage}]`)
+              spinner3.fail(`Unable send push transaction [error: ${response.error_description}]`)
               this.exit(1)
             }
             const pushTransactionRes = JSON.stringify(response.tx_hash)
@@ -497,7 +529,7 @@ Lattice.flags = {
   fee: flags.string({
     char: 'f',
     required: false,
-    description: '(default: 100) QRL (f)ee for transaction in Shor'
+    description: '(default: 0) QRL (f)ee for transaction in Shor'
   }),
 
   otsindex: flags.string({ 

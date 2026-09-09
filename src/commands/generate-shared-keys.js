@@ -65,46 +65,64 @@ const openEphemeralFile = function oEF(path) {
   return JSON.parse(contents)[0]
 }
 
-const waitForQRLLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the QRLLIB object has the str2bin function.
-    // This is sufficient to tell us QRLLIB has loaded.
-    if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
-      callBack()
-    } else {
-      QRLLIBLoaded = true
-      return waitForQRLLIB(callBack)
+// Resolves once QRLLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForQRLLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the QRLLIB object has the str2bin function.
+        // This is sufficient to tell us QRLLIB has loaded.
+        if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          QRLLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
-const waitForKYBLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the KYBLIB object has the getString function.
-    // This is sufficient to tell us KYBLIB has loaded.
-    if (typeof KYBLIB.getString === 'function' && KYBLIBLoaded === true) {
-      callBack()
-    } else {
-      KYBLIBLoaded = true
-      return waitForKYBLIB(callBack)
+    poll()
+  })
+// Resolves once KYBLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForKYBLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the KYBLIB object has the getString function.
+        // This is sufficient to tell us KYBLIB has loaded.
+        if (typeof KYBLIB.getString === 'function' && KYBLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          KYBLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
-const waitForDILLIB = (callBack) => {
-  setTimeout(() => {
-    // Test the DILLIB object has the getString function.
-    // This is sufficient to tell us DILLIB has loaded.
-    if (typeof DILLIB.getString === 'function' && DILLIBLoaded === true) {
-      callBack()
-    } else {
-      DILLIBLoaded = true
-      return waitForDILLIB(callBack)
+// Resolves once DILLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForDILLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the DILLIB object has the getString function.
+        // This is sufficient to tell us DILLIB has loaded.
+        if (typeof DILLIB.getString === 'function' && DILLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          DILLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
 
 
@@ -279,6 +297,9 @@ const checkLatticeJSON = (check) => {
         }
       return valid
     }
+    // Unreachable: arrayLength >= 2 guarantees the loop body runs, and every
+    // path through that body returns, so the loop can never fall through.
+    /* istanbul ignore next */
     return valid
   }
   return valid
@@ -288,10 +309,17 @@ const checkLatticeJSON = (check) => {
 function isFileEmpty(fileName, ignoreWhitespace=true) {
   return new Promise((resolve, reject) => {
     fs.readFile(fileName, (err, data) => {
+      // Reached when the path exists but cannot be read as a file - a directory,
+      // say. Callers await this now, so the rejection is theirs to report.
       if( err ) {
         reject(err);
         return;
       }
+      // The !ignoreWhitespace arm is unreachable through the public command:
+      // ignoreWhitespace defaults to true and no call site passes a second
+      // argument. Kept for a future internal caller that wants byte-exact
+      // emptiness rather than whitespace-only.
+      /* istanbul ignore next */
       resolve((!ignoreWhitespace && data.length === 0) || (ignoreWhitespace && !!String(data).match(/^\s*$/)))
     });
   })
@@ -327,16 +355,20 @@ class LatticeShared extends Command {
 // /////////////////////////
 // 0.a Secret Lattice keys
 // /////////////////////////
+    // Both latticePK and latticeSK are declared required, so oclif rejects the
+    // command before run() is ever called if either is missing (an empty string
+    // counts as missing too); the else arm cannot be reached from the CLI.
+    /* istanbul ignore else */
     if (args.latticeSK) {
       // check if the secret keys are a file or json
       if (fs.existsSync(args.latticeSK)) {
         // file submitted, is file empty?
-        isFileEmpty(args.latticeSK).then( (isEmpty) => {
-          if (isEmpty) {
-            spinner.fail('File is empty...')
-            this.exit(1)
-          }
-        })
+        // Awaited: unawaited, this raced the synchronous JSON.parse below, so an
+        // empty file was usually reported as unparseable rather than as empty.
+        if (await isFileEmpty(args.latticeSK)) {
+          spinner.fail('File is empty...')
+          this.exit(1)
+        }
         try{
           latticeSK = openFile(args.latticeSK)
         }
@@ -444,6 +476,8 @@ class LatticeShared extends Command {
 // 0.c Public Lattice keys
 // /////////////////////////
     // Check for file, txhash or JSON
+    // Required arg, as above: this guard cannot be false from the CLI.
+    /* istanbul ignore else */
     if (args.latticePK) {
         // check if the public keys are a file or json
         if (fs.existsSync(args.latticePK)) {
@@ -517,8 +551,8 @@ class LatticeShared extends Command {
       const bobKyberPK = latticePK[pubKeyIndexNum].pk1
       const bobECDSAPK = latticePK[pubKeyIndexNum].pk3
 
-      waitForKYBLIB(async () => {
-        waitForDILLIB(async () => {
+      await waitForKYBLIB(async () => {
+        await waitForDILLIB(async () => {
           spinner.succeed(`Generating new shared secrets for`)
           spinner.succeed(`Address: ${latticePK[0].address}`)
           spinner.succeed(`Lattice Tx Hash: ${latticePK[pubKeyIndexNum].txHash}`)
@@ -535,7 +569,9 @@ class LatticeShared extends Command {
           const sharedKey = KYBOBJECT_SENDER.getMyKey()
           spinner.succeed(`Secrets Generated, encrypting keys...`)
           // encrypt cyphertext with encrypted AES key
-          eccrypto.encrypt(Buffer.from(bobECDSAPK, 'hex'), Buffer.from(aliceCypherText)).then( function eccCypher(encryptedCypherText) {
+          // Awaited, and the callback returns its inner promise, so run() does not return
+          // while the keylist is still being written.
+          await eccrypto.encrypt(Buffer.from(bobECDSAPK, 'hex'), Buffer.from(aliceCypherText)).then( function eccCypher(encryptedCypherText) {
             const mykey = Uint8Array.from(Buffer.from(sharedKey.toString(), 'hex'))
             // Encrypt the seed *s* with shared key *key*.
             // The CTR counter is explicitly fixed at 1 (matching the decrypt
@@ -555,7 +591,7 @@ class LatticeShared extends Command {
             fs.writeFileSync(signedMessage, signedMsgJson)
             spinner.succeed(`Signed Message File file written to: ${signedMessage}`)
             // 9 - Generate the next 1000 keys with Shake128 and shared secret seed
-            waitForQRLLIB(async () => {
+            return waitForQRLLIB(async () => {
               const sBin = QRLLIB.hstr2bin(Buffer.from(Buffer.from(seed).toString('hex')))
               let keylist = QRLLIB.shake128(64000, sBin)
               if (flags.encryptPassword) {
@@ -598,12 +634,11 @@ class LatticeShared extends Command {
       if (fs.existsSync(args.cypherText)) {
         // is file empty?
 // spinner.succeed('is the file empty? ')
-        isFileEmpty(args.cypherText).then( (isEmpty) => {
-          if (isEmpty) {
-            spinner.fail('Ciphertext File is empty...')
-            this.exit(1)
-          }
-        })
+        // Awaited, as above: this used to race openEphemeralFile's JSON.parse.
+        if (await isFileEmpty(args.cypherText)) {
+          spinner.fail('Ciphertext File is empty...')
+          this.exit(1)
+        }
         encCypherTextJson = openEphemeralFile(args.cypherText)
         // check for valid json here
         validCypherTextJson = await checkCipherTextJson(encCypherTextJson)
@@ -632,12 +667,11 @@ class LatticeShared extends Command {
       // is signedMessage a file?
       if (fs.existsSync(args.signedMessage)) {
         // is file empty?
-        isFileEmpty(args.signedMessage).then( (isEmpty) => {
-          if (isEmpty) {
-            spinner.fail('signedMessage File is empty...')
-            this.exit(1)
-          }
-        })
+        // Awaited, as above: this used to race openEphemeralFile's JSON.parse.
+        if (await isFileEmpty(args.signedMessage)) {
+          spinner.fail('signedMessage File is empty...')
+          this.exit(1)
+        }
         signedMsgJson = openEphemeralFile(args.signedMessage)
         // check for valid json here
         validSignedMessageJson = await checkSignedMessageJson(signedMsgJson)
@@ -664,16 +698,12 @@ class LatticeShared extends Command {
 
       spinner.succeed('Shared secrets found, decrypting and generating shared keylist')
       // Generate keys from found list using secret key and pub key from sender
-      waitForKYBLIB(async () => {
-        waitForDILLIB(async () => {
-          try {
-            encCypherText = encCypherTextJson
-            signedMsg = signedMsgJson
-          } 
-          catch (error) {
-          	spinner.fail('cant open files...')
-            this.exit(1)
-          }
+      await waitForKYBLIB(async () => {
+        await waitForDILLIB(async () => {
+          // Both were read and validated above; these are plain assignments, so there is
+          // nothing here that can fail.
+          encCypherText = encCypherTextJson
+          signedMsg = signedMsgJson
           // 1 - verify p signature using Alice's dilithium public key 
           const verifySignedMsg = DILLIB.Dilithium.sign_open('', signedMsg, aliceDilithiumPK.toString('hex'))
           // if signature verified
@@ -688,7 +718,9 @@ class LatticeShared extends Command {
             ciphertext: Buffer.from(encCypherText.ciphertext),
             mac: Buffer.from(encCypherText.mac),
           }
-          eccrypto.decrypt(Buffer.from(bobECDSASK.toString(), 'hex'), encCypherTextBuffer).then(function eccDecrypt(decCypherText) {
+          // Awaited, and the callback returns its inner promise, so run() does not return
+          // while the keylist is still being written.
+          await eccrypto.decrypt(Buffer.from(bobECDSASK.toString(), 'hex'), encCypherTextBuffer).then(function eccDecrypt(decCypherText) {
             // 4 - Bob kem_decodes with cyphertext to obtain shared key
             KYBOBJECT_RECEIVER.kem_decode(decCypherText.toString())
             const sharedKey = KYBOBJECT_RECEIVER.getMyKey()
@@ -700,7 +732,7 @@ class LatticeShared extends Command {
             const sDecrypted = aesCtr.decrypt(encryptedBytes)
             // Bob now has access to the seed s and the shared key sent from Alice
             // 6 - Generate the next 1000 keys with Shake, creating the same keylist as Alice has
-            waitForQRLLIB(async () => {
+            return waitForQRLLIB(async () => {
               const sBin = QRLLIB.hstr2bin(Buffer.from(Buffer.from(sDecrypted).toString('hex')))
               const keyList = QRLLIB.shake128(64000, sBin)
               fs.writeFileSync(sharedKeyListFile, QRLLIB.bin2hstr(keyList), {mode: 0o600})

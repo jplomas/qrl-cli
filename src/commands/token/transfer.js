@@ -15,17 +15,25 @@ const { signBoundTransaction, ResponseBindingError } = require('../../functions/
 
 let QRLLIBLoaded = false
 
-const waitForQRLLIB = (callBack) => {
-  setTimeout(() => {
-    if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
-      callBack()
-    } else {
-      QRLLIBLoaded = true
-      return waitForQRLLIB(callBack)
+// Resolves once QRLLIB has loaded *and* `callBack` has run to completion, so run() can
+// await the work instead of returning while it is still going. Without that, a this.exit()
+// inside the callback surfaces as an unhandled rejection rather than an exit code.
+const waitForQRLLIB = (callBack) =>
+  new Promise((resolve, reject) => {
+    const poll = () => {
+      setTimeout(() => {
+        // Test the QRLLIB object has the str2bin function.
+        // This is sufficient to tell us QRLLIB has loaded.
+        if (typeof QRLLIB.str2bin === 'function' && QRLLIBLoaded === true) {
+          Promise.resolve().then(callBack).then(resolve, reject)
+        } else {
+          QRLLIBLoaded = true
+          poll()
+        }
+      }, 50)
     }
-    return false
-  }, 50)
-}
+    poll()
+  })
 
 const openWalletFile = (path) => {
   const contents = fs.readFileSync(path)
@@ -90,11 +98,15 @@ class TokenTransfer extends Command {
         message: 'Enter Amount of Tokens to Transfer:',
         validate: value => value > 0 ? true : 'Amount must be positive'
       })
-      flags.amount = response.amount.toString()
-      if (!flags.amount) {
+      // Checked before the conversion, not after. Two answers mean "no answer": a
+      // cancelled prompt returns nothing at all, and a blank submission returns an
+      // empty string, which the `>= 0` validator lets through as 0. Calling toString()
+      // on the first threw a TypeError one line ahead of the check meant to catch it.
+      if (response.amount === undefined || response.amount === '') {
         this.log(`${red('⨉')} Operation cancelled.`)
         this.exit(1)
       }
+      flags.amount = response.amount.toString()
     }
 
     // 4. OTS index
@@ -109,11 +121,15 @@ class TokenTransfer extends Command {
         message: 'Enter OTS key index (e.g. 0):',
         validate: value => value >= 0 ? true : 'OTS index must be 0 or greater'
       })
-      flags.otsindex = response.otsindex.toString()
-      if (!flags.otsindex) {
+      // Checked before the conversion, not after. Two answers mean "no answer": a
+      // cancelled prompt returns nothing at all, and a blank submission returns an
+      // empty string, which the `>= 0` validator lets through as 0. Calling toString()
+      // on the first threw a TypeError one line ahead of the check meant to catch it.
+      if (response.otsindex === undefined || response.otsindex === '') {
         this.log(`${red('⨉')} Operation cancelled.`)
         this.exit(1)
       }
+      flags.otsindex = response.otsindex.toString()
     }
 
     // 5. Wallet / Keys
@@ -158,6 +174,7 @@ class TokenTransfer extends Command {
     let address = ''
     if (flags.wallet) {
       let isValidFile = false
+      let badPassword = false
       let walletJson
       try {
         // Inside the try: a missing or malformed file must reach the "invalid wallet file"
@@ -176,17 +193,26 @@ class TokenTransfer extends Command {
           } else {
             password = await cli.prompt('Enter password for wallet file', { type: 'hide' })
           }
-          address = aes.decrypt(password, walletJson.address)
-          hexseed = aes.decrypt(password, walletJson.hexseed)
-          if (validateQrlAddress.hexString(address).result) {
-            isValidFile = true
-          } else {
-            this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
-            this.exit(1)
+          // Two ways a wrong password shows up: the v2 format is authenticated, so decryption
+          // throws, and the legacy format is not, so it decrypts to nonsense that fails the
+          // address check. Both mean the password is wrong rather than the file. Reporting it
+          // from inside this try used to be swallowed by the catch below, which then printed
+          // "invalid wallet file" on top of it - two contradictory messages for one mistake.
+          try {
+            address = aes.decrypt(password, walletJson.address)
+            hexseed = aes.decrypt(password, walletJson.hexseed)
+            isValidFile = validateQrlAddress.hexString(address).result
+          } catch (error) {
+            isValidFile = false
           }
+          badPassword = !isValidFile
         }
       } catch (error) {
         isValidFile = false
+      }
+      if (badPassword) {
+        this.log(`${red('⨉')} Unable to open wallet file: invalid password`)
+        this.exit(1)
       }
       if (!isValidFile) {
         this.log(`${red('⨉')} Unable to open wallet file: invalid wallet file`)
@@ -213,7 +239,7 @@ class TokenTransfer extends Command {
     }
 
     const spinner = ora({ text: 'Connecting to QRL node...' }).start()
-    waitForQRLLIB(async () => {
+    await waitForQRLLIB(async () => {
       let XMSS_OBJECT
       try {
         if (hexseed.match(' ') === null) {
@@ -224,7 +250,7 @@ class TokenTransfer extends Command {
           XMSS_OBJECT = await new QRLLIB.Xmss.fromMnemonic(hexseed)
         }
       } catch (err) {
-        spinner.fail(`Failed to recreate XMSS wallet object: ${err.message}`)
+        spinner.fail('Failed to recreate XMSS wallet object: invalid hexseed or mnemonic')
         this.exit(1)
       }
 

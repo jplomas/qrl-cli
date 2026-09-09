@@ -6,7 +6,10 @@
 const assert = require('assert')
 const {spawn} = require('child_process')
 const fs = require('fs')
+const os = require('os')
+const path = require('path')
 const setup = require('../test_setup')
+const aesUtil = require('../../src/utils/aes')
 
 // Suites needing on-chain state (skipped in offline mock mode: hooks create no broadcast txs)
 const describeOnline = process.env.QRL_TEST_OFFLINE === 'true' ? describe.skip : describe
@@ -1261,5 +1264,709 @@ describeOnline('generate-shared-keys #2d', () => {
   })
   it('exit code should be 0 if bob re-generates shared keys for bob using his txID', () => {
     assert.strictEqual(exitCode, 0)
+  })
+})
+
+// ///////////////////////////////////////////////////////////////////////////
+// Offline lattice crypto coverage
+//
+// Everything above this line stops before the Kyber/Dilithium maths runs:
+// generate-shared-keys opens a gRPC connection to a node (section "0.b" of the
+// command) *before* it touches any key material, so with no node reachable the
+// command exits there and none of the crypto is ever executed. That is why the
+// end-to-end cases above are all gated behind describeOnline, and why they
+// contribute nothing in CI, which runs with QRL_TEST_OFFLINE=true.
+//
+// The crypto itself needs no node at all. The cases below drive it through
+// test/commands/generate-shared-keys.offline-runner.js, which runs the command
+// in-process with Qrlnode.prototype.connect/api replaced by local stubs. No
+// socket is opened and no server is started; only those two methods are
+// replaced, and every case additionally passes -g 127.0.0.1:1 so that even a
+// stub failure could only ever reach a closed loopback port.
+//
+// The fixtures are generated locally in the before() hook below (a wallet and
+// two lattice key pairs, neither broadcast, so no OTS key is consumed).
+// ///////////////////////////////////////////////////////////////////////////
+
+// A closed port on loopback. Nothing leaves the machine.
+const DEAD_NODE = '127.0.0.1:1'
+const RUNNER = path.join(__dirname, 'generate-shared-keys.offline-runner.js')
+
+// Own directory: the shared hooks empty test/lattice, and other suites run in parallel.
+const OFFLINE = path.join(os.tmpdir(), 'qrl-cli-shared-keys-offline')
+const off = (name) => path.join(OFFLINE, name)
+
+const WALLET = off('wallet.json')
+const ALICE_SK = off('alice-lattice.json')
+const BOB_SK = off('bob-lattice.json')
+const ALICE_PUB = off('alice-pub.json')
+const BOB_PUB = off('bob-pub.json')
+const ALICE_SK_ENC = off('alice-lattice-enc.json') // decrypts to network "Testnet"
+const ALICE_SK_ENC_BAD_NETWORK = off('alice-lattice-enc-bad-network.json')
+const BASE_CIPHERTEXT = off('base-cyphertext.txt')
+const BASE_SIGNED = off('base-signed-message.txt')
+const BASE_KEYLIST = off('base-keylist.txt')
+const WHITESPACE = off('whitespace.txt')
+const NO_ENTRIES = off('no-entries.txt') // []
+const NO_KEYS = off('no-keys.txt') // [{}]
+const NOT_JSON = off('not-json.txt')
+const LATTICE_PASSWORD = 'password123'
+const TX_HASH = 'ab'.repeat(32)
+
+// A shared key list is shake128(64000) rendered as hex.
+const KEYLIST_LENGTH = 128000
+
+// Run the offline runner and capture what the command said.
+function runOffline(args, env) {
+  return new Promise((resolve) => {
+    const child = spawn('node', [RUNNER].concat(args, ['-g', DEAD_NODE]), {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {...process.env, ...(env || {})},
+    })
+    let out = ''
+    child.stdout.on('data', (d) => {
+      out += d.toString()
+    })
+    child.stderr.on('data', (d) => {
+      out += d.toString()
+    })
+    child.on('close', (code) => resolve({code, out}))
+  })
+}
+
+// Run the real CLI, for the paths that do not need a node at all.
+function runCli(args) {
+  return new Promise((resolve) => {
+    const child = spawn('./bin/run', args, {stdio: ['ignore', 'pipe', 'pipe']})
+    let out = ''
+    child.stdout.on('data', (d) => {
+      out += d.toString()
+    })
+    child.stderr.on('data', (d) => {
+      out += d.toString()
+    })
+    child.on('close', (code) => resolve({code, out}))
+  })
+}
+
+const readJson = (file) => JSON.parse(fs.readFileSync(file))
+
+// The public key file layout `get-keys` writes: [{address, network}, {pk1, pk2, pk3, tx_hash}]
+function publicKeyFile(secretKeyFile, address) {
+  const keys = readJson(secretKeyFile)[0]
+  return [
+    {address, network: 'Testnet'},
+    {pk1: keys.kyberPK, pk2: keys.dilithiumPK, pk3: keys.ecdsaPK, tx_hash: TX_HASH},
+  ]
+}
+
+// An encrypted lattice key file, as `generate-lattice-keys -e` writes them.
+function encryptedKeyFile(secretKeyFile, password, network) {
+  const keys = readJson(secretKeyFile)[0]
+  const enc = (value) => aesUtil.encrypt(password, value)
+  return [
+    {
+      encrypted: true,
+      tx_hash: enc(TX_HASH),
+      network: enc(network),
+      kyberPK: enc(keys.kyberPK),
+      kyberSK: enc(keys.kyberSK),
+      dilithiumPK: enc(keys.dilithiumPK),
+      dilithiumSK: enc(keys.dilithiumSK),
+      ecdsaPK: enc(keys.ecdsaPK),
+      ecdsaSK: enc(keys.ecdsaSK),
+    },
+  ]
+}
+
+describe('generate-shared-keys offline crypto', () => {
+  let aliceSecretJson
+  let bobPublicJson
+  let encryptedSecretJson
+  let baseCipherText
+  let baseSignedMessage
+  let baseKeyList
+
+  // Fixture generation is the slow part (two lattice key pairs and one full
+  // shared key exchange); it happens once and every case below reuses it.
+  before(async function generateFixtures() {
+    this.timeout(300000)
+    // Start from nothing: the CLI will not overwrite a wallet that is already
+    // there, and this directory survives between runs on a persistent machine.
+    fs.rmSync(OFFLINE, {recursive: true, force: true})
+    fs.mkdirSync(OFFLINE, {recursive: true})
+    // No -b anywhere: nothing is broadcast, so no OTS key is used.
+    await runCli(['create-wallet', '-3', '-h', '6', '-f', WALLET])
+    await runCli(['generate-lattice-keys', '-w', WALLET, '-i', '1', '-c', ALICE_SK])
+    await runCli(['generate-lattice-keys', '-w', WALLET, '-i', '2', '-c', BOB_SK])
+
+    fs.writeFileSync(ALICE_PUB, JSON.stringify(publicKeyFile(ALICE_SK, 'Q010203')))
+    fs.writeFileSync(BOB_PUB, JSON.stringify(publicKeyFile(BOB_SK, 'Q040506')))
+    fs.writeFileSync(ALICE_SK_ENC, JSON.stringify(encryptedKeyFile(ALICE_SK, LATTICE_PASSWORD, 'Testnet')))
+    // "false" is what an un-broadcast key file carries, and it is not one of the
+    // three network names the command accepts after decryption.
+    fs.writeFileSync(
+      ALICE_SK_ENC_BAD_NETWORK,
+      JSON.stringify(encryptedKeyFile(ALICE_SK, LATTICE_PASSWORD, 'false'))
+    )
+    fs.writeFileSync(WHITESPACE, '   \n  ')
+    fs.writeFileSync(NO_ENTRIES, '[]')
+    fs.writeFileSync(NO_KEYS, '[{}]')
+    fs.writeFileSync(NOT_JSON, 'this is not json')
+
+    aliceSecretJson = fs.readFileSync(ALICE_SK, 'utf8')
+    bobPublicJson = fs.readFileSync(BOB_PUB, 'utf8')
+    encryptedSecretJson = fs.readFileSync(ALICE_SK_ENC, 'utf8')
+
+    // One canonical exchange, used as the input of every "Bob" case below.
+    await runOffline([BOB_PUB, ALICE_SK, '-c', BASE_CIPHERTEXT, '-s', BASE_SIGNED, '-k', BASE_KEYLIST])
+    baseCipherText = JSON.stringify(readJson(BASE_CIPHERTEXT)[0])
+    baseSignedMessage = fs.readFileSync(BASE_SIGNED, 'utf8')
+    baseKeyList = fs.readFileSync(BASE_KEYLIST, 'utf8')
+  })
+
+  // -------------------------------------------------------------------------
+  // The connection gate itself
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #36 - node unreachable', () => {
+    let result
+    before(async function connectFails() {
+      this.timeout(120000)
+      result = await runCli([
+        'generate-shared-keys',
+        BOB_PUB,
+        ALICE_SK,
+        '-c', off('unused-cyphertext.txt'),
+        '-s', off('unused-signed.txt'),
+        '-k', off('unused-keylist.txt'),
+        '-g', DEAD_NODE,
+      ])
+    })
+    it('says it could not reach the node, with valid key material on both sides', () => {
+      assert.ok(result.out.includes('Failed to connect to node'), result.out)
+      assert.notStrictEqual(result.code, 0)
+    })
+    it('writes no output files when it cannot reach a node', () => {
+      assert.strictEqual(fs.existsSync(off('unused-keylist.txt')), false)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Case #1: Alice generates
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #37 - alice generates a shared key list', () => {
+    let result
+    before(async function aliceGenerates() {
+      this.timeout(200000)
+      result = await runOffline(
+        [BOB_PUB, ALICE_SK, '-c', off('a37-ct.txt'), '-s', off('a37-sm.txt'), '-k', off('a37-kl.txt')]
+      )
+    })
+    it('reports the recipient address it generated secrets for', () => {
+      assert.ok(result.out.includes('Generating new shared secrets for'), result.out)
+      assert.ok(result.out.includes('Address: Q040506'), result.out)
+      assert.strictEqual(result.code, 0)
+    })
+    it('writes the cyphertext as an eccrypto payload', () => {
+      const cipher = readJson(off('a37-ct.txt'))[0]
+      assert.deepStrictEqual(Object.keys(cipher).sort(), ['ciphertext', 'ephemPublicKey', 'iv', 'mac'])
+    })
+    it('writes a dilithium signed message of the expected length', () => {
+      assert.strictEqual(readJson(off('a37-sm.txt'))[0].length, 5466)
+    })
+    it('writes a shake128 key list of 64000 bytes', () => {
+      const keylist = fs.readFileSync(off('a37-kl.txt'), 'utf8')
+      assert.strictEqual(keylist.length, KEYLIST_LENGTH)
+      assert.ok(/^[0-9a-f]+$/.test(keylist))
+    })
+    it('writes the key list with 0600 permissions', () => {
+      // eslint-disable-next-line no-bitwise
+      assert.strictEqual(fs.statSync(off('a37-kl.txt')).mode & 0o777, 0o600)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Case #2: Bob regenerates. This is the property that matters: both sides
+  // must derive the same key list from the same exchange.
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #38 - bob regenerates the same key list', () => {
+    let result
+    before(async function bobRegenerates() {
+      this.timeout(200000)
+      result = await runOffline(
+        [ALICE_PUB, BOB_SK, BASE_CIPHERTEXT, BASE_SIGNED, '-k', off('b38-kl.txt')]
+      )
+    })
+    it('reports that it found the shared secrets', () => {
+      assert.ok(result.out.includes('Shared secrets found, decrypting and generating shared keylist'), result.out)
+      assert.ok(result.out.includes('Keylist generated and written to'), result.out)
+      assert.strictEqual(result.code, 0)
+    })
+    it('derives byte for byte the key list alice generated', () => {
+      assert.strictEqual(fs.readFileSync(off('b38-kl.txt'), 'utf8'), baseKeyList)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Output and input format variations
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #39 - key list encrypted with -e', () => {
+    let result
+    before(async function encryptedKeylist() {
+      this.timeout(200000)
+      result = await runOffline(
+        [
+          BOB_PUB, ALICE_SK,
+          '-c', off('a39-ct.txt'), '-s', off('a39-sm.txt'), '-k', off('a39-kl.txt'),
+          '-e', 'keylistpassword',
+        ]
+      )
+    })
+    it('writes an encrypted key list rather than the raw hex', () => {
+      assert.ok(result.out.includes('Shared Key List file written to'), result.out)
+      const keylist = fs.readFileSync(off('a39-kl.txt'), 'utf8')
+      assert.ok(keylist.startsWith('v2:'), keylist.slice(0, 40))
+      assert.strictEqual(aesUtil.decrypt('keylistpassword', keylist).length, KEYLIST_LENGTH)
+    })
+  })
+
+  describe('generate-shared-keys #40 - keys given as JSON rather than files', () => {
+    let result
+    before(async function jsonKeys() {
+      this.timeout(200000)
+      result = await runOffline(
+        [
+          bobPublicJson, aliceSecretJson,
+          '-c', off('a40-ct.txt'), '-s', off('a40-sm.txt'), '-k', off('a40-kl.txt'),
+        ]
+      )
+    })
+    it('accepts both sides as JSON strings', () => {
+      assert.ok(result.out.includes('Address: Q040506'), result.out)
+      assert.strictEqual(fs.readFileSync(off('a40-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+      assert.strictEqual(result.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #41 - encrypted lattice key file', () => {
+    let result
+    before(async function encryptedFile() {
+      this.timeout(200000)
+      result = await runOffline(
+        [
+          BOB_PUB, ALICE_SK_ENC,
+          '-c', off('a41-ct.txt'), '-s', off('a41-sm.txt'), '-k', off('a41-kl.txt'),
+          '-d', LATTICE_PASSWORD,
+        ]
+      )
+    })
+    it('decrypts the key file and generates the same key list as the plaintext keys', () => {
+      assert.ok(result.out.includes('Shared Key List file written to'), result.out)
+      assert.strictEqual(fs.readFileSync(off('a41-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+      assert.strictEqual(result.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #42 - encrypted lattice keys as JSON', () => {
+    let result
+    before(async function encryptedJson() {
+      this.timeout(200000)
+      result = await runOffline(
+        [
+          BOB_PUB, encryptedSecretJson,
+          '-c', off('a42-ct.txt'), '-s', off('a42-sm.txt'), '-k', off('a42-kl.txt'),
+          '-d', LATTICE_PASSWORD,
+        ]
+      )
+    })
+    it('decrypts JSON passed on the command line', () => {
+      assert.strictEqual(fs.readFileSync(off('a42-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+      assert.strictEqual(result.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #41a - a node that answers on a later attempt', () => {
+    let result
+    before(async function retriedConnection() {
+      this.timeout(200000)
+      // The command retries the connection up to five times before giving up. The
+      // public-key lookup below is the only thing that needs the node at all.
+      result = await runOffline(
+        [
+          BOB_PUB, ALICE_SK,
+          '-c', off('a41a-ct.txt'), '-s', off('a41a-sm.txt'), '-k', off('a41a-kl.txt'),
+        ],
+        {GSK_CONNECT_ON: '3'}
+      )
+    })
+
+    it('reports each retry', () => {
+      assert.ok(/retry connection attempt: 0/.test(result.out), result.out)
+      assert.ok(/retry connection attempt: 1/.test(result.out), result.out)
+    })
+
+    it('carries on and generates the key list once it is through', () => {
+      assert.strictEqual(result.code, 0, result.out)
+      assert.strictEqual(fs.readFileSync(off('a41a-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+    })
+  })
+
+  describe('generate-shared-keys #42a - encrypted lattice keys with no -d flag', () => {
+    let fileResult
+    let jsonResult
+    before(async function promptedPassword() {
+      this.timeout(200000)
+      // Without -d the password is asked for at the terminal, which is the only
+      // way to use an encrypted key file without putting its password in shell
+      // history. Both the file and the JSON form ask separately.
+      fileResult = await runOffline(
+        [
+          BOB_PUB, ALICE_SK_ENC,
+          '-c', off('a42a-ct.txt'), '-s', off('a42a-sm.txt'), '-k', off('a42a-kl.txt'),
+        ],
+        {GSK_PROMPT_PASSWORD: LATTICE_PASSWORD}
+      )
+      jsonResult = await runOffline(
+        [
+          BOB_PUB, encryptedSecretJson,
+          '-c', off('a42b-ct.txt'), '-s', off('a42b-sm.txt'), '-k', off('a42b-kl.txt'),
+        ],
+        {GSK_PROMPT_PASSWORD: LATTICE_PASSWORD}
+      )
+    })
+
+    it('takes the password typed at the prompt for a key file', () => {
+      assert.strictEqual(fileResult.code, 0, fileResult.out)
+      assert.strictEqual(fs.readFileSync(off('a42a-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+    })
+
+    it('takes the password typed at the prompt for keys given as JSON', () => {
+      assert.strictEqual(jsonResult.code, 0, jsonResult.out)
+      assert.strictEqual(fs.readFileSync(off('a42b-kl.txt'), 'utf8').length, KEYLIST_LENGTH)
+    })
+  })
+
+  describe('generate-shared-keys #43 - decrypted keys carry no usable network', () => {
+    let fileResult
+    let jsonResult
+    before(async function badNetwork() {
+      this.timeout(200000)
+      const args = (secret) => [
+        BOB_PUB, secret,
+        '-c', off('a43-ct.txt'), '-s', off('a43-sm.txt'), '-k', off('a43-kl.txt'),
+        '-d', LATTICE_PASSWORD,
+      ]
+      fileResult = await runOffline(args(ALICE_SK_ENC_BAD_NETWORK))
+      jsonResult = await runOffline(args(fs.readFileSync(ALICE_SK_ENC_BAD_NETWORK, 'utf8')))
+    })
+    it('rejects a key file whose network is not Testnet/Mainnet/GRPC', () => {
+      // The file branch wraps this check in a try/catch, so the exit surfaces
+      // as a decryption failure rather than as the "Bad passphrase" message.
+      assert.ok(fileResult.out.includes('Failed to decrypt'), fileResult.out)
+      assert.notStrictEqual(fileResult.code, 0)
+    })
+    it('rejects the same keys passed as JSON', () => {
+      assert.ok(jsonResult.out.includes('Data still encrypted... Bad passphrase?'), jsonResult.out)
+      assert.notStrictEqual(jsonResult.code, 0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Public keys fetched from a transaction hash
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #44 - transaction hash lookups', () => {
+    let notFound
+    let notLattice
+    let latticeFound
+    before(async function txLookups() {
+      this.timeout(200000)
+      const args = [TX_HASH, ALICE_SK, '-c', off('a44-ct.txt'), '-s', off('a44-sm.txt'), '-k', off('a44-kl.txt')]
+      notFound = await runOffline(args, {GSK_API: 'notfound'})
+      notLattice = await runOffline(args, {GSK_API: 'nolattice'})
+      latticeFound = await runOffline(args, {GSK_API: 'lattice', GSK_PUBFILE: BOB_PUB})
+    })
+    it('fails when the node has no such transaction', () => {
+      assert.ok(notFound.out.includes('Unable to find transaction'), notFound.out)
+      assert.notStrictEqual(notFound.code, 0)
+    })
+    it('fails when the transaction is not a lattice transaction', () => {
+      assert.ok(notLattice.out.includes('No lattice transaction found'), notLattice.out)
+      assert.notStrictEqual(notLattice.code, 0)
+    })
+    it('rejects the keys it built from a lattice transaction', () => {
+      // Bug: the on-chain branch builds the entry with a `txHash` key, while the
+      // validator (and `get-keys`) require `tx_hash`, so a lookup by transaction
+      // hash can never succeed however good the transaction is.
+      assert.ok(latticeFound.out.includes('Grabbing public keys from'), latticeFound.out)
+      assert.ok(latticeFound.out.includes('Output #1 does not have a tx_hash'), latticeFound.out)
+      assert.notStrictEqual(latticeFound.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #45 - pubKeyIndex flag', () => {
+    let result
+    before(async function pubKeyIndex() {
+      this.timeout(120000)
+      result = await runOffline([
+        BOB_PUB, ALICE_SK,
+        '-c', off('a45-ct.txt'), '-s', off('a45-sm.txt'), '-k', off('a45-kl.txt'),
+        '-i', '1',
+      ])
+    })
+    it('cannot use -i at all', () => {
+      // Bug: pubKeyIndex is a string flag, and the command calls .toNumber() on it.
+      assert.ok(result.out.includes('flags.pubKeyIndex.toNumber is not a function'), result.out)
+    })
+  })
+
+  describe('generate-shared-keys #46 - public keys with no entries', () => {
+    let result
+    before(async function emptyPublicArray() {
+      this.timeout(120000)
+      result = await runOffline([
+        '[]', ALICE_SK,
+        '-c', off('a46-ct.txt'), '-s', off('a46-sm.txt'), '-k', off('a46-kl.txt'),
+      ])
+    })
+    it('passes validation and then falls over reading the keys', () => {
+      // An empty array satisfies checkLatticeJSON (it checks a one entry secret
+      // file and a two entry public file, and says nothing about zero entries).
+      assert.ok(result.out.includes("Cannot read properties of undefined (reading 'pk1')"), result.out)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Case #2 input validation, none of which is reachable without a node
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #47 - only one half of the exchange', () => {
+    let result
+    before(async function halfExchange() {
+      this.timeout(120000)
+      result = await runOffline([ALICE_PUB, BOB_SK, BASE_CIPHERTEXT, '-k', off('a47-kl.txt')])
+    })
+    it('requires both the cyphertext and the signed message', () => {
+      assert.ok(result.out.includes('Both Shared Secret and Shared Keys are required'), result.out)
+      assert.notStrictEqual(result.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #48 - unusable cyphertext', () => {
+    const results = {}
+    before(async function badCipherText() {
+      this.timeout(200000)
+      const run = async (key, cypher) => {
+        results[key] = await runOffline([ALICE_PUB, BOB_SK, cypher, BASE_SIGNED, '-k', off('a48-kl.txt')])
+      }
+      const without = (field) => {
+        const cipher = JSON.parse(baseCipherText)
+        delete cipher[field]
+        return JSON.stringify(cipher)
+      }
+      await run('noEntries', NO_ENTRIES)
+      await run('noKeys', NO_KEYS)
+      await run('notJson', 'definitely not json')
+      await run('iv', without('iv'))
+      await run('ephemPublicKey', without('ephemPublicKey'))
+      await run('ciphertext', without('ciphertext'))
+      await run('mac', without('mac'))
+    })
+    it('rejects a cyphertext file with no entries', () => {
+      assert.ok(results.noEntries.out.includes('encCipherTextJson... array is undefined'), results.noEntries.out)
+    })
+    it('rejects a cyphertext entry with no keys', () => {
+      assert.ok(results.noKeys.out.includes('encCipherTextJson... length of array is 0'), results.noKeys.out)
+    })
+    it('rejects a cyphertext that is neither a file nor JSON', () => {
+      assert.ok(results.notJson.out.includes('No valid cyphertext JSON data passed'), results.notJson.out)
+    })
+    it('names the eccrypto field that is missing', () => {
+      assert.ok(results.iv.out.includes('does not have a iv key buffer'), results.iv.out)
+      assert.ok(results.ephemPublicKey.out.includes('does not have a ephemPublicKey key buffer'), results.ephemPublicKey.out)
+      assert.ok(results.ciphertext.out.includes('does not have a ciphertext key buffer'), results.ciphertext.out)
+      assert.ok(results.mac.out.includes('does not have a mac key buffer'), results.mac.out)
+    })
+    it('exits non-zero for every one of them', () => {
+      Object.keys(results).forEach((key) => {
+        assert.notStrictEqual(results[key].code, 0, key)
+      })
+    })
+  })
+
+  describe('generate-shared-keys #49 - cyphertext passed as JSON', () => {
+    let result
+    before(async function cipherTextJson() {
+      this.timeout(200000)
+      result = await runOffline([ALICE_PUB, BOB_SK, baseCipherText, BASE_SIGNED, '-k', off('a49-kl.txt')])
+    })
+    it('derives the same key list from a cyphertext given on the command line', () => {
+      assert.strictEqual(fs.readFileSync(off('a49-kl.txt'), 'utf8'), baseKeyList)
+      assert.strictEqual(result.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #50 - unusable signed message', () => {
+    const results = {}
+    before(async function badSignedMessage() {
+      this.timeout(200000)
+      const run = async (key, signed) => {
+        results[key] = await runOffline([ALICE_PUB, BOB_SK, BASE_CIPHERTEXT, signed, '-k', off('a50-kl.txt')])
+      }
+      await run('noEntries', '[]')
+      await run('notJson', 'definitely not json')
+      await run('tooShort', '["abc"]')
+      await run('shortFile', NO_KEYS)
+    })
+    it('rejects a signed message array with no entries', () => {
+      assert.ok(results.noEntries.out.includes('Signed Message JSON... array is undefined'), results.noEntries.out)
+    })
+    it('reports invalid JSON and then the empty message it was left with', () => {
+      assert.ok(results.notJson.out.includes('invalid signed message json'), results.notJson.out)
+      assert.ok(results.notJson.out.includes('Signed Message JSON... array is undefined'), results.notJson.out)
+    })
+    it('rejects a message that is not 5466 characters', () => {
+      assert.ok(results.tooShort.out.includes('Invalid output length 3, expected message length is 5466'), results.tooShort.out)
+    })
+    it('rejects a signed message file whose entry is the wrong shape', () => {
+      assert.ok(results.shortFile.out.includes('Invalid JSON found in Signed Message JSON'), results.shortFile.out)
+    })
+    it('exits non-zero for every one of them', () => {
+      Object.keys(results).forEach((key) => {
+        assert.notStrictEqual(results[key].code, 0, key)
+      })
+    })
+  })
+
+  describe('generate-shared-keys #51 - signed message passed as JSON', () => {
+    let result
+    before(async function signedMessageJson() {
+      this.timeout(120000)
+      result = await runOffline([ALICE_PUB, BOB_SK, BASE_CIPHERTEXT, baseSignedMessage, '-k', off('a51-kl.txt')])
+    })
+    it('fails loudly rather than reporting success it did not achieve', () => {
+      // The file branch unwraps the array and hands dilithium the message; the JSON
+      // branch validates entry [0] and then hands dilithium the whole array, which
+      // throws. That throw used to happen in a callback nothing awaited, so the
+      // command printed 'keys generated!', wrote no key list, and exited zero.
+      assert.ok(result.out.includes('Shared secrets found, decrypting and generating shared keylist'), result.out)
+      assert.ok(/Cannot pass non-string to std::string/.test(result.out), result.out)
+      assert.ok(!result.out.includes('keys generated!'), result.out)
+      assert.strictEqual(fs.existsSync(off('a51-kl.txt')), false)
+      assert.notStrictEqual(result.code, 0)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Unreadable inputs
+  // -------------------------------------------------------------------------
+  describe('generate-shared-keys #52 - whitespace only files', () => {
+    const results = {}
+    before(async function whitespaceFiles() {
+      this.timeout(200000)
+      results.secret = await runOffline([
+        BOB_PUB, WHITESPACE,
+        '-c', off('a52-ct.txt'), '-s', off('a52-sm.txt'), '-k', off('a52-kl.txt'),
+      ])
+      results.cypher = await runOffline([ALICE_PUB, BOB_SK, WHITESPACE, BASE_SIGNED, '-k', off('a52-kl.txt')])
+      results.signed = await runOffline([ALICE_PUB, BOB_SK, BASE_CIPHERTEXT, WHITESPACE, '-k', off('a52-kl.txt')])
+    })
+    // The emptiness check is awaited, so it always reports before the JSON parse
+    // that would otherwise reject the same file as unreadable: each of these says
+    // the file is empty, which is the useful message of the two.
+    it('rejects a secret key file with nothing in it', () => {
+      assert.ok(/File is empty/.test(results.secret.out), results.secret.out)
+      assert.notStrictEqual(results.secret.code, 0)
+    })
+    it('rejects a cyphertext file with nothing in it', () => {
+      assert.ok(/Ciphertext File is empty/.test(results.cypher.out), results.cypher.out)
+      assert.notStrictEqual(results.cypher.code, 0)
+    })
+    it('rejects a signed message file with nothing in it', () => {
+      assert.ok(/signedMessage File is empty/.test(results.signed.out), results.signed.out)
+      assert.notStrictEqual(results.signed.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #53 - secret keys that are neither file nor JSON', () => {
+    let unreadableFile
+    let notJson
+    before(async function unreadableSecrets() {
+      this.timeout(200000)
+      unreadableFile = await runOffline([
+        BOB_PUB, NOT_JSON,
+        '-c', off('a53-ct.txt'), '-s', off('a53-sm.txt'), '-k', off('a53-kl.txt'),
+      ])
+      notJson = await runOffline([
+        BOB_PUB, 'still not json',
+        '-c', off('a53-ct.txt'), '-s', off('a53-sm.txt'), '-k', off('a53-kl.txt'),
+      ])
+    })
+    it('reports a file it cannot parse', () => {
+      assert.ok(unreadableFile.out.includes('Unable to open file'), unreadableFile.out)
+      assert.notStrictEqual(unreadableFile.code, 0)
+    })
+    it('reports an argument that is not JSON either', () => {
+      assert.ok(notJson.out.includes('Invalid JSON given'), notJson.out)
+      assert.notStrictEqual(notJson.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #56 - public keys that are neither file, hash nor JSON', () => {
+    let result
+    before(async function publicKeysNotJson() {
+      this.timeout(120000)
+      result = await runOffline([
+        'not a file, not a hash, not json', ALICE_SK,
+        '-c', off('a56-ct.txt'), '-s', off('a56-sm.txt'), '-k', off('a56-kl.txt'),
+      ])
+    })
+    it('reports the public keys are unusable', () => {
+      assert.ok(result.out.includes('not valid json or json file given'), result.out)
+      assert.notStrictEqual(result.code, 0)
+    })
+  })
+  describe('generate-shared-keys #54 - public key file missing its header entry', () => {
+    let noAddress
+    let noNetwork
+    before(async function badPublicHeader() {
+      this.timeout(200000)
+      const keys = readJson(BOB_PUB)
+      const run = (header) =>
+        runOffline([
+          JSON.stringify([header, keys[1]]), ALICE_SK,
+          '-c', off('a54-ct.txt'), '-s', off('a54-sm.txt'), '-k', off('a54-kl.txt'),
+        ])
+      noAddress = await run({network: 'Testnet'})
+      noNetwork = await run({address: 'Q040506'})
+    })
+    it('rejects public keys with no address', () => {
+      assert.ok(noAddress.out.includes('Output #0 does not have a address'), noAddress.out)
+      assert.notStrictEqual(noAddress.code, 0)
+    })
+    it('rejects public keys with no network', () => {
+      assert.ok(noNetwork.out.includes('Output #0 does not have a network'), noNetwork.out)
+      assert.notStrictEqual(noNetwork.code, 0)
+    })
+  })
+
+  describe('generate-shared-keys #55 - a directory where a key file should be', () => {
+    let result
+    before(async function directoryAsKeyFile() {
+      this.timeout(120000)
+      result = await runOffline([
+        BOB_PUB, OFFLINE,
+        '-c', off('a55-ct.txt'), '-s', off('a55-sm.txt'), '-k', off('a55-kl.txt'),
+      ])
+    })
+    it('reports it cannot read the directory', () => {
+      // fs.existsSync says yes to a directory, so the emptiness check is the first
+      // thing that actually reads it. It is awaited now, so its EISDIR rejection is
+      // reported instead of racing the JSON parse that follows.
+      assert.ok(/EISDIR: illegal operation on a directory/.test(result.out), result.out)
+      assert.notStrictEqual(result.code, 0)
+    })
+
+    it('writes no key list', () => {
+      assert.strictEqual(fs.existsSync(off('a55-kl.txt')), false)
+    })
   })
 })
